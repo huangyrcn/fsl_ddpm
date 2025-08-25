@@ -115,7 +115,7 @@ class GraphCNN(nn.Module):
             Adj_block_idx = torch.cat([Adj_block_idx, self_loop_edge], 1)
             Adj_block_elem = torch.cat([Adj_block_elem, elem], 0)
 
-        Adj_block = torch.sparse.FloatTensor(Adj_block_idx, Adj_block_elem, torch.Size([start_idx[-1], start_idx[-1]]))
+        Adj_block = torch.sparse_coo_tensor(Adj_block_idx, Adj_block_elem, torch.Size([start_idx[-1], start_idx[-1]]))
 
         return Adj_block.to(self.device), Adj_block_idx
 
@@ -152,7 +152,7 @@ class GraphCNN(nn.Module):
             Adj_block_idx = torch.cat([Adj_block_idx, self_loop_edge], 1)
             Adj_block_elem = torch.cat([Adj_block_elem, elem], 0)
 
-        Adj_block = torch.sparse.FloatTensor(Adj_block_idx, Adj_block_elem, torch.Size([start_idx[-1], start_idx[-1]]))
+        Adj_block = torch.sparse_coo_tensor(Adj_block_idx, Adj_block_elem, torch.Size([start_idx[-1], start_idx[-1]]))
 
         return Adj_block.to(self.device), Adj_block_idx
 
@@ -179,7 +179,7 @@ class GraphCNN(nn.Module):
             idx.extend([[i, j] for j in range(start_idx[i], start_idx[i + 1], 1)])
         elem = torch.FloatTensor(elem)
         idx = torch.LongTensor(idx).transpose(0, 1)
-        graph_pool = torch.sparse.FloatTensor(idx, elem, torch.Size([len(batch_graph), start_idx[-1]]))
+        graph_pool = torch.sparse_coo_tensor(idx, elem, torch.Size([len(batch_graph), start_idx[-1]]))
 
         return graph_pool.to(self.device)
 
@@ -208,7 +208,7 @@ class GraphCNN(nn.Module):
 
         elem = torch.FloatTensor(elem)
         idx = torch.LongTensor(idx).transpose(0, 1)
-        graph_pool = torch.sparse.FloatTensor(idx, elem, torch.Size([len(batch_graph), start_idx[-1]]))
+        graph_pool = torch.sparse_coo_tensor(idx, elem, torch.Size([len(batch_graph), start_idx[-1]]))
 
         return graph_pool.to(self.device)
 

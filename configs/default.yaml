@@ -1,0 +1,41 @@
+# 默认训练配置文件
+# 数据集配置
+dataset_name: "TRIANGLES"
+baseline_mode: null
+
+# 少样本学习参数
+N_way: 3
+K_shot: 5
+query_size: 10
+patience: 5
+
+# 模型参数
+dropout: 0.5
+batch: 128
+
+# GIN网络参数
+gin_layer: 3
+gin_hid: 128
+
+# 数据增强参数
+aug1: "node_drop"
+aug2: "feature_mask"
+t: 0.2
+
+# 优化器参数
+lr: 0.001
+weight_decay: 1e-7
+
+# 训练参数
+eval_interval: 100
+epoch_num: 3000
+
+# 其他参数
+use_select_sim: false
+gen_train_num: 500
+gen_test_num: 20
+save_test_emb: true
+test_mixup: true
+num_token: 1
+
+

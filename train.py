@@ -3,7 +3,7 @@ import json
 import math
 import torch
 import random
-import argparse
+from omegaconf import OmegaConf
 import numpy as np
 import networkx as nx
 import torch.nn as nn
@@ -15,7 +15,8 @@ from aug import aug_fea_mask, aug_drop_node, aug_fea_drop, aug_fea_dropout
 from dataset import Dataset, Graph, load_data
 from collections import defaultdict
 from numpy.random import RandomState
-from sklearn.linear_model import LogisticRegression
+from tqdm import tqdm
+
 from ogb.graphproppred import GraphPropPredDataset
 
 
@@ -53,7 +54,7 @@ class Trainer:
         self.opt = optim.SGD([{'params': self.log.parameters()}, {'params': self.prompt.parameters()}], lr=0.01)
         self.xent = nn.CrossEntropyLoss()
 
-    def train(self):
+    def train(self, log_file=None):
         # best_test_acc = 0
         # best_valid_acc = 0
         best = 1e9
@@ -83,16 +84,25 @@ class Trainer:
         elif self.args.aug2 == 'feature_dropout':
             graph_aug2 = aug_fea_dropout(self.dataset.train_graphs)
 
-        print("graph augmentation complete!")
-
-        for i in range(self.epoch_num):
+        # 添加进度条 - 动态长度
+        pbar = tqdm(range(self.epoch_num), desc="Training", dynamic_ncols=True, leave=True)
+        
+        for i in pbar:
             loss = self.train_one_step(mode='train', epoch=i, graph_aug1=graph_aug1, graph_aug2=graph_aug2)
 
-            if loss == None: continue
+            if loss == None: 
+                continue
 
-            if i % 50 == 0:
-                print('Epoch {} Loss {:.4f}'.format(i, loss))
-                f.write('Epoch {} Loss {:.4f}'.format(i, loss) + '\n')
+            # 更新进度条描述
+            pbar.set_description(f"Training | Epoch {i:4d} | Loss {loss:.4f}")
+
+            # 按eval_interval进行评估
+            if i % self.eval_interval == 0:
+                # 记录到日志
+                if log_file:
+                    log_file.write('Epoch {} Loss {:.4f}'.format(i, loss) + '\n')
+                
+                # 检查是否是最佳loss
                 if loss < best:
                     best = loss
                     best_t = i
@@ -100,23 +110,44 @@ class Trainer:
                     torch.save(self.model.state_dict(), './savepoint/' + self.args.dataset_name + '_model.pkl')
                 else:
                     cnt_wait += 1
-            if cnt_wait > self.patience:
-                print("Early Stopping!")
-                break
+                
+                # 早停检查
+                if cnt_wait > self.patience:
+                    pbar.close()
+                    print(f"Early Stopping at epoch {i}")
+                    print(f"Best loss: {best:.4f} achieved at epoch {best_t}")
+                    return
+        
+        # 训练完成
+        pbar.close()
+        print(f"Training completed! Best loss: {best:.4f} at epoch {best_t}")
 
-    def test(self):
+    def test(self, log_file=None):
         best_test_acc = 0
-        self.model.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_model.pkl'))
+        self.model.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_model.pkl', weights_only=True))
         print("model load success!")
         self.model.eval()
 
         test_accs = []
         start_test_idx = 0
+        
+        # 计算测试任务总数
+        total_test_tasks = (len(self.dataset.test_graphs) - self.K_shot * self.dataset.test_classes_num) // (self.N_way * self.query_size)
+        
+        # 添加测试进度条 - 动态长度
+        test_pbar = tqdm(total=total_test_tasks, desc="Testing", dynamic_ncols=True, leave=True)
+        
         while start_test_idx < len(self.dataset.test_graphs) - self.K_shot * self.dataset.test_classes_num:
             test_acc = self.train_one_step(mode='test', epoch=0, test_idx=start_test_idx)
             test_accs.append(test_acc)
             start_test_idx += self.N_way * self.query_size
+            
+            # 更新测试进度条
+            test_pbar.update(1)
+            test_pbar.set_description(f"Testing | Task {len(test_accs)}/{total_test_tasks} | Acc {test_acc:.4f}")
 
+        test_pbar.close()
+        
         # print('test task num', len(test_accs))
         mean_acc = sum(test_accs) / len(test_accs)
         std = np.array(test_accs).std()
@@ -124,9 +155,10 @@ class Trainer:
         #             best_test_acc = mean_acc
 
         print('Mean Test Acc {:.4f}  Std {:.4f}'.format(mean_acc, std))
-        f.write('Mean Test Acc {:.4f}  Std {:.4f}'.format(mean_acc, std) + '\n')
+        if log_file:
+            log_file.write('Mean Test Acc {:.4f}  Std {:.4f}'.format(mean_acc, std) + '\n')
 
-        return best_test_acc
+        return mean_acc  # 返回平均准确率，而不是best_test_acc
 
     def train_one_step(self, mode, epoch, graph_aug1=None, graph_aug2=None, test_idx=None, baseline_mode=None):
         if mode == 'train':
@@ -214,7 +246,7 @@ class Trainer:
                     print("Early Stopping!")
                     break
 
-            self.log.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_lr.pkl'))
+            self.log.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_lr.pkl', weights_only=True))
             self.log.eval()
             self.prompt.eval()
             prompt_embeds = self.prompt()
@@ -246,84 +278,3 @@ class Trainer:
             test_acc = acc.cpu().numpy()
 
             return test_acc
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-
-    # GIN parameters
-    parser.add_argument('--dataset_name', type=str, default="TRIANGLES",
-                        help='name of dataset')
-
-    parser.add_argument('--baseline_mode', type=str, default=None,
-                        help='baseline')
-
-    parser.add_argument('--N_way', type=int, default=3)
-    parser.add_argument('--K_shot', type=int, default=5)
-    parser.add_argument('--query_size', type=int, default=10)
-    parser.add_argument('--patience', type=int, default=5)
-
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--batch', type=float, default=128)
-
-    parser.add_argument('--gin_layer', type=int, default=3)
-    parser.add_argument('--gin_hid', type=int, default=128)
-    parser.add_argument('--aug1', type=str, default='node_drop')
-    parser.add_argument('--aug2', type=str, default='feature_mask')
-    parser.add_argument('--t', type=float, default=0.2)
-
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--weight_decay', type=float, default=1e-7)
-
-    parser.add_argument('--eval_interval', type=int, default=100)
-    parser.add_argument('--epoch_num', type=int, default=3000)
-
-    parser.add_argument('--use_select_sim', type=bool, default=False)
-    parser.add_argument('--gen_train_num', type=int, default=500)
-    parser.add_argument('--gen_test_num', type=int, default=20)
-
-    parser.add_argument('--save_test_emb', type=bool, default=True)
-    parser.add_argument('--test_mixup', type=bool, default=True)
-    parser.add_argument('--num_token', type=int, default=1)
-
-    args = parser.parse_args()
-    return args
-
-
-args = parse_arguments()
-
-args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-datasets = []  # ['TRIANGLES']
-datasets.append(args.dataset_name)
-res = {}
-
-for dataset in datasets:
-    # for k in [5]:  # 10
-        k = args.K_shot
-        accs = []
-        for seed_value in range(72, 73):
-            # for seed_value in range(5):
-            os.environ['PYTHONHASHSEED'] = str(seed_value)
-            random.seed(seed_value)
-            np.random.seed(seed_value)
-            torch.manual_seed(seed_value)
-            torch.cuda.manual_seed(seed_value)
-
-            text_file_name = './our_results/{}-{}-shot.txt'.format(dataset, k)
-            f = open(text_file_name, 'w')
-            file_name = './our_results/{}-{}-shot-params.txt'.format(dataset, k)
-
-            print(file_name)
-            args.dataset_name = dataset
-            trainer = Trainer(args)
-
-            trainer.train()
-            test_acc = trainer.test()
-            accs.append(test_acc)
-
-            res[test_acc] = str(args)
-            del trainer
-            del test_acc
-
-            json.dump(res, open(file_name, 'a'), indent=4)
-        # print("acc: ", np.array(accs).mean(), "std: ", np.array(accs).std())

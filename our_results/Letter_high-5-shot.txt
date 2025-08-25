@@ -1,0 +1,16 @@
+Epoch 0 Loss 6.2793
+Epoch 100 Loss 3.7640
+Epoch 200 Loss 3.7460
+Epoch 300 Loss 3.7237
+Epoch 400 Loss 3.7151
+Epoch 500 Loss 3.7165
+Epoch 600 Loss 3.7044
+Epoch 700 Loss 3.7134
+Epoch 800 Loss 3.6936
+Epoch 900 Loss 3.7030
+Epoch 1000 Loss 3.7133
+Epoch 1100 Loss 3.7275
+Epoch 1200 Loss 3.6954
+Epoch 1300 Loss 3.7002
+Epoch 1400 Loss 3.7049
+Mean Test Acc 0.7468  Std 0.0651
