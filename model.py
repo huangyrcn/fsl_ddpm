@@ -54,7 +54,7 @@ class MLP(nn.Module):
 class GraphCNN(nn.Module):
     def __init__(self, num_layers=5, num_mlp_layers=2, input_dim=200, hidden_dim=128, output_dim=200,
                  final_dropout=0.5, learn_eps=True, graph_pooling_type='sum', neighbor_pooling_type='sum',
-                 use_select_sim=False):
+                 use_select_sim=False, device=None):
         '''
             num_layers: number of layers in the neural networks (INCLUDING the input layer)
             num_mlp_layers: number of layers in mlps (EXCLUDING the input layer)
@@ -71,8 +71,7 @@ class GraphCNN(nn.Module):
         super(GraphCNN, self).__init__()
 
         self.final_dropout = final_dropout
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
+        self.device = device 
         self.num_layers = num_layers
         self.graph_pooling_type = graph_pooling_type
         self.neighbor_pooling_type = neighbor_pooling_type
@@ -288,7 +287,7 @@ class Model(nn.Module):
         self.sample_input_emb_size = args.sample_input_size
 
         self.gin = GraphCNN(input_dim=args.node_fea_size, use_select_sim=args.use_select_sim, num_layers=args.gin_layer,
-                            hidden_dim=args.gin_hid).to(self.device)  # .cuda()
+                            hidden_dim=args.gin_hid, device=self.device).to(self.device)  # .cuda()
 
         self.proj_head = nn.Sequential(nn.Linear(self.sample_input_emb_size, self.hid), nn.ReLU(inplace=True),
                                        nn.Linear(self.hid, self.hid))  # whether to use the batchnorm1d?

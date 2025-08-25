@@ -174,7 +174,7 @@ class Dataset:
         query_set = []
         for index in class_index:
             g_list = list(task_source[index])
-            if self.args.test_mixup:
+            if self.args.gen_test_num > 0:
                 mid = g_list[:K_shot] + list(self.generate_test_graphs[index])
                 support_set.append(mid)
             else:

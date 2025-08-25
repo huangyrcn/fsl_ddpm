@@ -1,26 +1,16 @@
-import os
-import json
-import math
 import torch
-import random
-import argparse
 import numpy as np
-import networkx as nx
+
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from copy import deepcopy
 from model import Model, Prompt, LogReg
 from aug import aug_fea_mask, aug_drop_node, aug_fea_drop, aug_fea_dropout
-from dataset import Dataset, Graph, load_data
-from collections import defaultdict
-from numpy.random import RandomState
-from sklearn.linear_model import LogisticRegression
-from ogb.graphproppred import GraphPropPredDataset
+from dataset import Dataset
 
 
 class Trainer:
-    def __init__(self, args):
+    def __init__(self, args, logf=None):
         self.args = args
         self.epoch_num = args.epoch_num
         self.K_shot = args.K_shot
@@ -28,6 +18,7 @@ class Trainer:
         self.device = self.args.device
         self.query_size = args.query_size
         self.eval_interval = args.eval_interval
+        self.logf = logf
 
         self.dataset = Dataset(args.dataset_name, args)
         args.train_classes_num = self.dataset.train_classes_num
@@ -50,7 +41,12 @@ class Trainer:
 
         # use torch to implement the linear reg
         self.log = LogReg(self.model.sample_input_emb_size, self.N_way).to(self.device)
-        self.opt = optim.SGD([{'params': self.log.parameters()}, {'params': self.prompt.parameters()}], lr=0.01)
+        
+        # 根据use_prompt决定优化器参数
+        if getattr(args, 'use_prompt', True):
+            self.opt = optim.SGD([{'params': self.log.parameters()}, {'params': self.prompt.parameters()}], lr=0.01)
+        else:
+            self.opt = optim.SGD([{'params': self.log.parameters()}], lr=0.01)
         self.xent = nn.CrossEntropyLoss()
 
     def train(self):
@@ -92,7 +88,8 @@ class Trainer:
 
             if i % 50 == 0:
                 print('Epoch {} Loss {:.4f}'.format(i, loss))
-                f.write('Epoch {} Loss {:.4f}'.format(i, loss) + '\n')
+                if self.logf is not None:
+                    self.logf.write('Epoch {} Loss {:.4f}'.format(i, loss) + '\n')
                 if loss < best:
                     best = loss
                     best_t = i
@@ -124,7 +121,8 @@ class Trainer:
         #             best_test_acc = mean_acc
 
         print('Mean Test Acc {:.4f}  Std {:.4f}'.format(mean_acc, std))
-        f.write('Mean Test Acc {:.4f}  Std {:.4f}'.format(mean_acc, std) + '\n')
+        if self.logf is not None:
+            self.logf.write('Mean Test Acc {:.4f}  Std {:.4f}'.format(mean_acc, std) + '\n')
 
         return best_test_acc
 
@@ -143,8 +141,12 @@ class Trainer:
 
         elif mode == 'test':
             self.model.eval()
-            self.prompt.train()
-            prompt_embeds = self.prompt()
+            
+            if self.args.use_prompt:
+                self.prompt.train()
+                prompt_embeds = self.prompt()
+            else:
+                prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.device)
 
             first_N_class_sample = np.array(list(range(self.dataset.test_classes_num)))
             current_task = self.dataset.sample_one_task(self.dataset.test_tasks, first_N_class_sample,
@@ -153,8 +155,8 @@ class Trainer:
             support_current_sample_input_embs, support_current_sample_input_embs_selected = self.model.sample_input_GNN(
                 [current_task], prompt_embeds, True)  # [N(K+Q), emb_size]
 
-            if not self.args.test_mixup:
-                support_data = support_current_sample_input_embs.detach().cpu().numpy()  # [NxK, d]
+            if self.args.gen_test_num == 0:
+                support_data = support_current_sample_input_embs.detach()  # [NxK, d] - 保持为tensor
 
             else:
                 # if not use .cpu().numpy(), it illustrates that we use the torch linear reg
@@ -191,10 +193,14 @@ class Trainer:
                 logits = self.log(support_data)
                 loss_ori = self.xent(logits, support_label)
 
-                # mixup data
-                logits_mix = self.log(support_data_mixup)  # [Nxgen, class]
-                loss_mix = (weight * self.xent(logits_mix, support_label_mix_a) + \
-                            (1 - weight) * self.xent(logits_mix, support_label_mix_b)).mean()
+                # 只有当有mixup数据时才计算mixup损失
+                if self.args.gen_test_num > 0:
+                    # mixup data
+                    logits_mix = self.log(support_data_mixup)  # [Nxgen, class]
+                    loss_mix = (weight * self.xent(logits_mix, support_label_mix_a) + \
+                                (1 - weight) * self.xent(logits_mix, support_label_mix_b)).mean()
+                else:
+                    loss_mix = torch.tensor(0.).to(self.device)
 
                 l2_reg = torch.tensor(0.).to(self.device)
                 for param in self.log.parameters():
@@ -216,18 +222,18 @@ class Trainer:
 
             self.log.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_lr.pkl'))
             self.log.eval()
-            self.prompt.eval()
-            prompt_embeds = self.prompt()
+            
+            if self.args.use_prompt:
+                self.prompt.eval()
+                prompt_embeds = self.prompt()
+            else:
+                prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.device)
 
             query_current_sample_input_embs, _ = self.model.sample_input_GNN(
                 [current_task], prompt_embeds, False)  # [N(K+Q), emb_size]
             query_label = []
 
-            if not self.args.test_mixup:
-                query_data = query_current_sample_input_embs.reshape(self.N_way, self.query_size,
-                                                                     self.model.sample_input_emb_size).detach().cpu().numpy()  # [NxQ, d]
-            else:
-                query_data = query_current_sample_input_embs.detach()  # .cpu().numpy()
+            query_data = query_current_sample_input_embs.detach()  # 统一处理，保持为tensor
 
             for graphs in current_task['query_set']:
                 query_label.append(np.array([graph.label for graph in graphs]))
@@ -246,84 +252,4 @@ class Trainer:
             test_acc = acc.cpu().numpy()
 
             return test_acc
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-
-    # GIN parameters
-    parser.add_argument('--dataset_name', type=str, default="TRIANGLES",
-                        help='name of dataset')
-
-    parser.add_argument('--baseline_mode', type=str, default=None,
-                        help='baseline')
-
-    parser.add_argument('--N_way', type=int, default=3)
-    parser.add_argument('--K_shot', type=int, default=5)
-    parser.add_argument('--query_size', type=int, default=10)
-    parser.add_argument('--patience', type=int, default=5)
-
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--batch', type=float, default=128)
-
-    parser.add_argument('--gin_layer', type=int, default=3)
-    parser.add_argument('--gin_hid', type=int, default=128)
-    parser.add_argument('--aug1', type=str, default='node_drop')
-    parser.add_argument('--aug2', type=str, default='feature_mask')
-    parser.add_argument('--t', type=float, default=0.2)
-
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--weight_decay', type=float, default=1e-7)
-
-    parser.add_argument('--eval_interval', type=int, default=100)
-    parser.add_argument('--epoch_num', type=int, default=3000)
-
-    parser.add_argument('--use_select_sim', type=bool, default=False)
-    parser.add_argument('--gen_train_num', type=int, default=500)
-    parser.add_argument('--gen_test_num', type=int, default=20)
-
-    parser.add_argument('--save_test_emb', type=bool, default=True)
-    parser.add_argument('--test_mixup', type=bool, default=True)
-    parser.add_argument('--num_token', type=int, default=1)
-
-    args = parser.parse_args()
-    return args
-
-
-args = parse_arguments()
-
-args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-datasets = []  # ['TRIANGLES']
-datasets.append(args.dataset_name)
-res = {}
-
-for dataset in datasets:
-    # for k in [5]:  # 10
-        k = args.K_shot
-        accs = []
-        for seed_value in range(72, 73):
-            # for seed_value in range(5):
-            os.environ['PYTHONHASHSEED'] = str(seed_value)
-            random.seed(seed_value)
-            np.random.seed(seed_value)
-            torch.manual_seed(seed_value)
-            torch.cuda.manual_seed(seed_value)
-
-            text_file_name = './our_results/{}-{}-shot.txt'.format(dataset, k)
-            f = open(text_file_name, 'w')
-            file_name = './our_results/{}-{}-shot-params.txt'.format(dataset, k)
-
-            print(file_name)
-            args.dataset_name = dataset
-            trainer = Trainer(args)
-
-            trainer.train()
-            test_acc = trainer.test()
-            accs.append(test_acc)
-
-            res[test_acc] = str(args)
-            del trainer
-            del test_acc
-
-            json.dump(res, open(file_name, 'a'), indent=4)
-        # print("acc: ", np.array(accs).mean(), "std: ", np.array(accs).std())
+__all__ = ["Trainer"]
