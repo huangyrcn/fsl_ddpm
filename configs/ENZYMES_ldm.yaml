@@ -1,3 +1,4 @@
+# 基础配置（来自原ENZYMES.yaml）
 dataset_name: ENZYMES
 baseline_mode: null
 N_way: 2
@@ -27,3 +28,20 @@ train_classes_num: 4
 test_classes_num: 2
 node_fea_size: 9
 sample_input_size: 256
+
+# LDM增强配置
+use_ldm_augmentation: true
+
+# LDM相关参数  
+learning_rate_ldm: 0.001
+weight_decay_ldm: 1.0e-04
+num_epochs_ldm: 200
+patience_ldm: 10
+time_steps: 100
+beta_start: 0.0001
+beta_end: 0.02
+ldm_batch_size: 64
+
+# 数据增强参数
+num_augmented_samples: 10
+batch_size_for_embedding: 32

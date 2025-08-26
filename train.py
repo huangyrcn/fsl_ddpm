@@ -93,7 +93,7 @@ class Trainer:
 
     def test(self):
         best_test_acc = 0
-        self.model.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_model.pkl'))
+        self.model.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_model.pkl', weights_only=True))
         print("model load success!")
         self.model.eval()
 
@@ -211,7 +211,7 @@ class Trainer:
                     print("Early Stopping!")
                     break
 
-            self.log.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_lr.pkl'))
+            self.log.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_lr.pkl', weights_only=True))
             self.log.eval()
 
         # 调用局部函数训练分类器

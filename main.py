@@ -8,6 +8,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from train import Trainer
+from unified_trainer import UnifiedTrainer
 
 def build_cfg():
     # 仅用 OmegaConf，从命令行读取：必须提供 config=path/to.yaml，其余键值用于覆盖
@@ -61,10 +62,41 @@ def main():
     # 最终配置
     OmegaConf.save(config=cfg, f=params_yaml)
 
+    # 检查是否启用LDM增强模式
+    use_ldm_augmentation = getattr(cfg, 'use_ldm_augmentation', False)
+    
     with open(text_file_name, 'w') as logf:
-        trainer = Trainer(cfg, logf=logf)
-        trainer.train()
-        test_acc = trainer.test()
+        if use_ldm_augmentation:
+            # 使用统一训练器进行多阶段训练
+            print("=== 启用LDM增强训练模式 ===")
+            unified_trainer = UnifiedTrainer(cfg, logf=logf)
+            
+            # 阶段1：训练encoder
+            unified_trainer.train_encoder()
+            
+            # 阶段2：初始化LDM并收集embeddings
+            unified_trainer.init_ldm_components()
+            unified_trainer.collect_training_embeddings()
+            
+            # 阶段3：训练LDM
+            unified_trainer.train_ldm()
+            
+            # 阶段4：测试
+            original_acc, original_std = unified_trainer.test_original()
+            ldm_acc, ldm_std = unified_trainer.test_with_ldm_augmentation()
+            
+            logf.write(f"=== 最终结果比较 ===\n")
+            logf.write(f"原始Encoder: {original_acc:.4f} ± {original_std:.4f}\n")
+            logf.write(f"LDM增强: {ldm_acc:.4f} ± {ldm_std:.4f}\n")
+            logf.write(f"提升: {ldm_acc - original_acc:.4f}\n")
+            
+            test_acc = ldm_acc  # 返回LDM增强的结果
+        else:
+            # 使用原始训练器
+            print("=== 使用原始训练模式 ===")
+            trainer = Trainer(cfg, logf=logf)
+            trainer.train()
+            test_acc = trainer.test()
 
     with open(params_txt, 'a') as f:
         json.dump({str(test_acc): str(cfg)}, f, indent=4)

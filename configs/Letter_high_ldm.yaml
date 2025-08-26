@@ -1,0 +1,47 @@
+# 基础配置（来自原Letter_high.yaml）
+dataset_name: Letter_high
+baseline_mode: null
+N_way: 2
+K_shot: 5
+query_size: 10
+patience: 5
+dropout: 0.5
+batch: 128
+gin_layer: 3
+gin_hid: 128
+aug1: node_drop
+aug2: feature_mask
+t: 0.2
+lr: 0.001
+weight_decay: 1.0e-07
+eval_interval: 100
+epoch_num: 3000
+use_select_sim: false
+gen_train_num: 500
+gen_test_num: 20
+save_test_emb: true
+
+num_token: 1
+use_prompt: false
+device: cuda
+train_classes_num: 13
+test_classes_num: 2
+node_fea_size: 2
+sample_input_size: 256
+
+# LDM增强配置
+use_ldm_augmentation: false
+
+# LDM相关参数  
+learning_rate_ldm: 0.001
+weight_decay_ldm: 1.0e-04
+num_epochs_ldm: 2000
+patience_ldm: 10
+time_steps: 500
+beta_start: 0.0001
+beta_end: 0.02
+ldm_batch_size: 64
+
+# 数据增强参数
+num_augmented_samples: 10
+batch_size_for_embedding: 32

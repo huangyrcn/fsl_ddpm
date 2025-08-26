@@ -297,6 +297,13 @@ class Model(nn.Module):
 
         self.dropout = nn.Dropout(args.dropout)
 
+    def encode_graphs(self, graphs, prompt_embs):
+        # 复用现有 GIN 前向，返回与 sample_input_GNN 相同维度的 pooled 表征
+        pooled_h_layers, node_embeds, Adj_block_idx, hidden_rep, final_hidd = \
+            self.gin(graphs, mode='test', promp=prompt_embs)
+        embs = torch.cat(pooled_h_layers[1:], -1)  # [B, D]
+        return embs
+
     def sample_input_GNN(self, tasks, prompt_embs, is_support):
         embs = []
         final_hidds = []
