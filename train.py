@@ -4,6 +4,7 @@ import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 from copy import deepcopy
+from tqdm import tqdm
 from model import Model, Prompt, LogReg
 from aug import aug_fea_mask, aug_drop_node, aug_fea_drop, aug_fea_dropout
 from dataset import Dataset
@@ -12,35 +13,23 @@ from dataset import Dataset
 class Trainer:
     def __init__(self, args, logf=None):
         self.args = args
-        self.epoch_num = args.epoch_num
-        self.K_shot = args.K_shot
-        self.patience = args.patience
-        self.device = self.args.device
-        self.query_size = args.query_size
-        self.eval_interval = args.eval_interval
         self.logf = logf
 
         self.dataset = Dataset(args.dataset_name, args)
         args.train_classes_num = self.dataset.train_classes_num
         args.test_classes_num = self.dataset.test_classes_num
         args.node_fea_size = self.dataset.train_graphs[0].node_features.shape[1]
-        args.sample_input_size = (args.gin_layer - 1) * args.gin_hid
 
         args.N_way = self.dataset.test_classes_num
-        self.N_way = self.dataset.test_classes_num
 
-        self.baseline_mode = args.baseline_mode
+        self.model = Model(args).to(args.device)  # .cuda()
 
-        self.model = Model(args).to(self.device)  # .cuda()
-
-        self.prompt = Prompt(self.args).to(self.device)
+        self.prompt = Prompt(self.args).to(args.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-        self.criterion = nn.CrossEntropyLoss()
-
         # use torch to implement the linear reg
-        self.log = LogReg(self.model.sample_input_emb_size, self.N_way).to(self.device)
+        self.log = LogReg(self.model.sample_input_emb_size, self.args.N_way).to(args.device)
         
         # 根据use_prompt决定优化器参数
         if getattr(args, 'use_prompt', True):
@@ -80,14 +69,15 @@ class Trainer:
             graph_aug2 = aug_fea_dropout(self.dataset.train_graphs)
 
         print("graph augmentation complete!")
-
-        for i in range(self.epoch_num):
-            loss = self.train_one_step(mode='train', epoch=i, graph_aug1=graph_aug1, graph_aug2=graph_aug2)
+        
+        # 新增1行：包装range为tqdm
+        for i in tqdm(range(self.args.epoch_num), desc="Training"):
+            loss = self._pretrain_step(graph_aug1, graph_aug2)
 
             if loss == None: continue
 
             if i % 50 == 0:
-                print('Epoch {} Loss {:.4f}'.format(i, loss))
+                tqdm.write('Epoch {} Loss {:.4f}'.format(i, loss))
                 if self.logf is not None:
                     self.logf.write('Epoch {} Loss {:.4f}'.format(i, loss) + '\n')
                 if loss < best:
@@ -97,8 +87,8 @@ class Trainer:
                     torch.save(self.model.state_dict(), './savepoint/' + self.args.dataset_name + '_model.pkl')
                 else:
                     cnt_wait += 1
-            if cnt_wait > self.patience:
-                print("Early Stopping!")
+            if cnt_wait > self.args.patience:
+                tqdm.write("Early Stopping!")
                 break
 
     def test(self):
@@ -109,10 +99,10 @@ class Trainer:
 
         test_accs = []
         start_test_idx = 0
-        while start_test_idx < len(self.dataset.test_graphs) - self.K_shot * self.dataset.test_classes_num:
-            test_acc = self.train_one_step(mode='test', epoch=0, test_idx=start_test_idx)
+        while start_test_idx < len(self.dataset.test_graphs) - self.args.K_shot * self.dataset.test_classes_num:
+            test_acc = self._evaluate_one_task(start_test_idx)
             test_accs.append(test_acc)
-            start_test_idx += self.N_way * self.query_size
+            start_test_idx += self.args.N_way * self.args.query_size
 
         # print('test task num', len(test_accs))
         mean_acc = sum(test_accs) / len(test_accs)
@@ -126,68 +116,69 @@ class Trainer:
 
         return best_test_acc
 
-    def train_one_step(self, mode, epoch, graph_aug1=None, graph_aug2=None, test_idx=None, baseline_mode=None):
-        if mode == 'train':
-            self.model.train()
-            train_embs = self.model(graph_aug1)
-            train_embs_aug = self.model(graph_aug2)
+    def _pretrain_step(self, graph_aug1, graph_aug2):
+        """执行一步对比学习的预训练"""
+        self.model.train()
+        train_embs = self.model(graph_aug1)
+        train_embs_aug = self.model(graph_aug2)
 
-            loss = self.model.loss_cal(train_embs, train_embs_aug)
+        loss = self.model.loss_cal(train_embs, train_embs_aug)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            return loss
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss
 
-        elif mode == 'test':
-            self.model.eval()
-            
-            if self.args.use_prompt:
-                self.prompt.train()
-                prompt_embeds = self.prompt()
-            else:
-                prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.device)
+    def _evaluate_one_task(self, test_idx):
+        """完整评估一个 few-shot 任务"""
+        self.model.eval()
+        
+        if self.args.use_prompt:
+            self.prompt.train()
+            prompt_embeds = self.prompt()
+        else:
+            prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.args.device)
 
-            first_N_class_sample = np.array(list(range(self.dataset.test_classes_num)))
-            current_task = self.dataset.sample_one_task(self.dataset.test_tasks, first_N_class_sample,
-                                                        K_shot=self.K_shot, query_size=self.query_size,
-                                                        test_start_idx=test_idx)
-            support_current_sample_input_embs, support_current_sample_input_embs_selected = self.model.sample_input_GNN(
-                [current_task], prompt_embeds, True)  # [N(K+Q), emb_size]
+        first_N_class_sample = np.array(list(range(self.dataset.test_classes_num)))
+        current_task = self.dataset.sample_one_task(self.dataset.test_tasks, first_N_class_sample,
+                                                    K_shot=self.args.K_shot, query_size=self.args.query_size,
+                                                    test_start_idx=test_idx)
+        support_current_sample_input_embs, support_current_sample_input_embs_selected = self.model.sample_input_GNN(
+            [current_task], prompt_embeds, True)  # [N(K+Q), emb_size]
 
-            if self.args.gen_test_num == 0:
-                support_data = support_current_sample_input_embs.detach()  # [NxK, d] - 保持为tensor
+        if self.args.gen_test_num == 0:
+            support_data = support_current_sample_input_embs.detach()  # [NxK, d] - 保持为tensor
 
-            else:
-                # if not use .cpu().numpy(), it illustrates that we use the torch linear reg
-                data = support_current_sample_input_embs.reshape(self.N_way, self.K_shot + self.args.gen_test_num,
-                                                                 self.model.sample_input_emb_size)
-                support_data, support_data_mixup = data[:, :self.K_shot, :].reshape(self.N_way * self.K_shot,
-                                                                                    self.model.sample_input_emb_size).detach(), data[
-                                                                                                                                :,
-                                                                                                                                self.K_shot:self.K_shot + self.args.gen_test_num,
-                                                                                                                                :].reshape(
-                    self.N_way * self.args.gen_test_num, self.model.sample_input_emb_size).detach()  # .cpu().numpy()
+        else:
+            # if not use .cpu().numpy(), it illustrates that we use the torch linear reg
+                            data = support_current_sample_input_embs.reshape(self.args.N_way, self.args.K_shot + self.args.gen_test_num,
+                                                       self.model.sample_input_emb_size)
+        support_data, support_data_mixup = data[:, :self.args.K_shot, :].reshape(self.args.N_way * self.args.K_shot,
+                                                                              self.model.sample_input_emb_size).detach(), data[
+                                                                                                                                                                                                          :,
+                                                                              self.args.K_shot:self.args.K_shot + self.args.gen_test_num,
+                                                                              :].reshape(
+                                                                              self.args.N_way * self.args.gen_test_num, self.model.sample_input_emb_size).detach()  # .cpu().numpy()
 
-            support_label, support_label_mix_a, weight, support_label_mix_b = [], [], [], []
-            for graphs in current_task['support_set']:
-                support_label.append(np.array([graph.label for graph in graphs[:self.K_shot]]))
-                support_label_mix_a.append(np.array([graph.y_a for graph in graphs[self.K_shot:]]))
-                support_label_mix_b.append(np.array([graph.y_b for graph in graphs[self.K_shot:]]))
-                weight.append(np.array([graph.lam for graph in graphs[self.K_shot:]]))
+        support_label, support_label_mix_a, weight, support_label_mix_b = [], [], [], []
+        for graphs in current_task['support_set']:
+            support_label.append(np.array([graph.label for graph in graphs[:self.args.K_shot]]))
+            support_label_mix_a.append(np.array([graph.y_a for graph in graphs[self.args.K_shot:]]))
+            support_label_mix_b.append(np.array([graph.y_b for graph in graphs[self.args.K_shot:]]))
+            weight.append(np.array([graph.lam for graph in graphs[self.args.K_shot:]]))
 
-            support_label = torch.LongTensor(np.hstack(support_label)).to(self.device)
-            support_label_mix_a = torch.LongTensor(np.hstack(support_label_mix_a)).to(self.device)
-            support_label_mix_b = torch.LongTensor(np.hstack(support_label_mix_b)).to(self.device)
-            weight = torch.FloatTensor(np.hstack(weight)).to(self.device)
+        support_label = torch.LongTensor(np.hstack(support_label)).to(self.args.device)
+        support_label_mix_a = torch.LongTensor(np.hstack(support_label_mix_a)).to(self.args.device)
+        support_label_mix_b = torch.LongTensor(np.hstack(support_label_mix_b)).to(self.args.device)
+        weight = torch.FloatTensor(np.hstack(weight)).to(self.args.device)
 
-            # this is used for linear function based on torch
+        # 局部函数：训练线性分类器
+        def _train_classifier():
             self.log.train()
             best_loss = 1e9
             wait = 0
             patience = 10
             for _ in range(500):
-
                 self.opt.zero_grad()
                 # original support data
                 logits = self.log(support_data)
@@ -200,9 +191,9 @@ class Trainer:
                     loss_mix = (weight * self.xent(logits_mix, support_label_mix_a) + \
                                 (1 - weight) * self.xent(logits_mix, support_label_mix_b)).mean()
                 else:
-                    loss_mix = torch.tensor(0.).to(self.device)
+                    loss_mix = torch.tensor(0.).to(self.args.device)
 
-                l2_reg = torch.tensor(0.).to(self.device)
+                l2_reg = torch.tensor(0.).to(self.args.device)
                 for param in self.log.parameters():
                     l2_reg += torch.norm(param)
                 loss_leg = loss_ori + loss_mix + 0.1 * l2_reg
@@ -222,34 +213,37 @@ class Trainer:
 
             self.log.load_state_dict(torch.load('./savepoint/' + self.args.dataset_name + '_lr.pkl'))
             self.log.eval()
-            
-            if self.args.use_prompt:
-                self.prompt.eval()
-                prompt_embeds = self.prompt()
-            else:
-                prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.device)
 
-            query_current_sample_input_embs, _ = self.model.sample_input_GNN(
-                [current_task], prompt_embeds, False)  # [N(K+Q), emb_size]
-            query_label = []
+        # 调用局部函数训练分类器
+        _train_classifier()
+        
+        if self.args.use_prompt:
+            self.prompt.eval()
+            prompt_embeds = self.prompt()
+        else:
+            prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.args.device)
 
-            query_data = query_current_sample_input_embs.detach()  # 统一处理，保持为tensor
+        query_current_sample_input_embs, _ = self.model.sample_input_GNN(
+            [current_task], prompt_embeds, False)  # [N(K+Q), emb_size]
+        query_label = []
 
-            for graphs in current_task['query_set']:
-                query_label.append(np.array([graph.label for graph in graphs]))
+        query_data = query_current_sample_input_embs.detach()  # 统一处理，保持为tensor
 
-            query_label = torch.LongTensor(np.hstack(query_label)).to(self.device)
+        for graphs in current_task['query_set']:
+            query_label.append(np.array([graph.label for graph in graphs]))
 
-            query_len = query_label.shape[0]
-            if current_task['append_count'] != 0:
-                query_data = query_data[: query_len - current_task['append_count'], :]
-                query_label = query_label[: query_len - current_task['append_count']]
+        query_label = torch.LongTensor(np.hstack(query_label)).to(self.args.device)
 
-            logits = self.log(query_data)
-            preds = torch.argmax(logits, dim=1)
-            acc = torch.sum(preds == query_label).float() / query_label.shape[0]
+        query_len = query_label.shape[0]
+        if current_task['append_count'] != 0:
+            query_data = query_data[: query_len - current_task['append_count'], :]
+            query_label = query_label[: query_len - current_task['append_count']]
 
-            test_acc = acc.cpu().numpy()
+        logits = self.log(query_data)
+        preds = torch.argmax(logits, dim=1)
+        acc = torch.sum(preds == query_label).float() / query_label.shape[0]
 
-            return test_acc
+        test_acc = acc.cpu().numpy()
+
+        return test_acc
 __all__ = ["Trainer"]

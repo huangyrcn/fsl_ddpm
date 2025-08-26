@@ -1,7 +1,7 @@
 dataset_name: ENZYMES
 baseline_mode: null
 N_way: 2
-K_shot: 5
+K_shot: 10
 query_size: 10
 patience: 5
 dropout: 0.5

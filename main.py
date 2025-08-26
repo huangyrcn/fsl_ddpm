@@ -48,7 +48,9 @@ def main():
         cfg.device = pick_best_device()
 
     results_dir = './our_results'
+    save_dir = './savepoint'
     os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
 
     dataset = cfg.dataset_name
     k = cfg.K_shot

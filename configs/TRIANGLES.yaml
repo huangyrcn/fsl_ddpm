@@ -9,7 +9,7 @@ batch: 128
 gin_layer: 3
 gin_hid: 128
 aug1: node_drop
-aug2: feature_mask
+aug2: feature_drop
 t: 0.2
 lr: 0.001
 weight_decay: 1.0e-07
