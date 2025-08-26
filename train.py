@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from copy import deepcopy
 from tqdm import tqdm
-from model import Model, Prompt, LogReg
+from gnn_model import Model, Prompt, LogReg
 from aug import aug_fea_mask, aug_drop_node, aug_fea_drop, aug_fea_dropout
 from dataset import Dataset
 
@@ -147,16 +147,16 @@ class Trainer:
             [current_task], prompt_embeds, True)  # [N(K+Q), emb_size]
 
         if self.args.gen_test_num == 0:
-            support_data = support_current_sample_input_embs.detach()  # [NxK, d] - 保持为tensor
-
+            # 没有 mixup 数据：直接使用原始嵌入
+            support_data = support_current_sample_input_embs.detach()
+            support_data_mixup = None
         else:
-            # if not use .cpu().numpy(), it illustrates that we use the torch linear reg
-                            data = support_current_sample_input_embs.reshape(self.args.N_way, self.args.K_shot + self.args.gen_test_num,
+            # 有 mixup 数据：需要 reshape 分离
+            data = support_current_sample_input_embs.reshape(self.args.N_way, self.args.K_shot + self.args.gen_test_num,
                                                        self.model.sample_input_emb_size)
-        support_data, support_data_mixup = data[:, :self.args.K_shot, :].reshape(self.args.N_way * self.args.K_shot,
-                                                                              self.model.sample_input_emb_size).detach(), data[
-                                                                                                                                                                                                          :,
-                                                                              self.args.K_shot:self.args.K_shot + self.args.gen_test_num,
+            support_data = data[:, :self.args.K_shot, :].reshape(self.args.N_way * self.args.K_shot,
+                                                                              self.model.sample_input_emb_size).detach()
+            support_data_mixup = data[:, self.args.K_shot:self.args.K_shot + self.args.gen_test_num,
                                                                               :].reshape(
                                                                               self.args.N_way * self.args.gen_test_num, self.model.sample_input_emb_size).detach()  # .cpu().numpy()
 
