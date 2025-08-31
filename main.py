@@ -107,15 +107,15 @@ def main():
             else:
                 unified_trainer.train_ldm()
             
-            # 阶段3.5：LDM训练完成后的数据可视化
-            print("=== 开始LDM训练完成后的数据可视化 ===")
-            # 调用可视化函数，生成支持集、测试数据和生成数据的可视化
-            save_path = os.path.join(results_dir, f"{dataset}-{k}-shot-ldm-visualization.png")
-            support_embs, test_embs, generated_embs = unified_trainer.visualize_support_query_generation(
-                num_samples_per_prototype=getattr(cfg, 'num_augmented_samples', 30),
-                save_path=save_path
-            )
-            print(f"✅ 数据可视化完成，图片保存到: {save_path}")
+            # # 阶段3.5：LDM训练完成后的数据可视化
+            # print("=== 开始LDM训练完成后的数据可视化 ===")
+            # # 调用可视化函数，生成支持集、测试数据和生成数据的可视化
+            # save_path = os.path.join(results_dir, f"{dataset}-{k}-shot-ldm-visualization.png")
+            # support_embs, test_embs, generated_embs = unified_trainer.visualize_support_query_generation(
+            #     num_samples_per_prototype=getattr(cfg, 'num_augmented_samples', 30),
+            #     save_path=save_path
+            # )
+            # print(f"✅ 数据可视化完成，图片保存到: {save_path}")
             
             # 阶段4：测试
             original_acc, original_std = unified_trainer.test_model(use_ldm_augmentation=False, test_name="原始Encoder测试（无LDM增强）")

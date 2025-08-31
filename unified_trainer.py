@@ -216,40 +216,34 @@ class UnifiedTrainer:
             self.training_embeddings = self.model.encode_graphs(all_graphs, prompt_embeds)  # [N, D]
             self.training_labels = torch.tensor([graph.label for graph in all_graphs], device=self.args.device)
     
-        print(f"收集了 {self.training_embeddings.shape[0]} 个训练embeddings，维度: {self.training_embeddings.shape}")
-        
         # 根据参数选择条件类型
-        condition_type = getattr(self.args, 'condition_type', 'kmeans')  # 默认为kmeans
+        condition_type = getattr(self.args, 'condition_type', 'self_labeling')  # 默认为self_labeling
         
-        if condition_type == 'kmeans':
-            # 使用 K-Means 进行聚类获取类别 Prototype
-            kmeans = KMeans(n_init=10, n_clusters=self.args.train_classes_num, random_state=42)
-            cluster_labels = kmeans.fit_predict(self.training_embeddings.cpu().detach().numpy())  # (N,) 或 (num_graphs,)
-            prototypes = torch.tensor(
-                kmeans.cluster_centers_, dtype=torch.float, device=self.args.device
-            )  # num_clusters x latent_dim
-            self.prototypes = prototypes
-
-            # 计算每个样本的类别 Prototype 作为条件
-            cluster_labels = torch.tensor(cluster_labels, dtype=torch.long, device=self.args.device)
-            self.conditions = prototypes[cluster_labels]  # 获取每个样本对应的 Prototype
-            
-            print(f"K-Means聚类完成，prototypes形状: {prototypes.shape}")
-            print(f"Prototype-based条件数据形状: {self.conditions.shape}")
-            
-        elif condition_type == 'self_conditioning':
+        if condition_type == 'self_labeling':
             # 使用样本自己作为条件
             self.conditions = self.training_embeddings.clone()
             # 注意：这里不设置self.prototypes，但在可视化时会重新计算kmeans
             
-            print(f"使用self-conditioning，条件数据形状: {self.conditions.shape}")
+        elif condition_type == 'class_proto':
+            # 训练阶段：使用K-means聚类获取类别原型
+            kmeans = KMeans(n_init=10, n_clusters=self.args.train_classes_num, random_state=42)
+            cluster_labels = kmeans.fit_predict(self.training_embeddings.cpu().detach().numpy())
+            prototypes = torch.tensor(
+                kmeans.cluster_centers_, dtype=torch.float, device=self.args.device
+            )
+            self.prototypes = prototypes
+
+            # 计算每个样本的类别 Prototype 作为条件
+            cluster_labels = torch.tensor(cluster_labels, dtype=torch.long, device=self.args.device)
+            self.conditions = prototypes[cluster_labels]
+            
+            print(f"训练阶段：K-Means聚类完成，prototypes形状: {prototypes.shape}")
             
         else:
-            raise ValueError(f"不支持的condition_type: {condition_type}，支持的类型: kmeans, self_conditioning")
+            raise ValueError(f"不支持的condition_type: {condition_type}，支持的类型: self_labeling, class_proto")
         
         # 对条件进行归一化
         self.conditions = F.normalize(self.conditions, dim=1)
-        print(f"最终条件数据形状: {self.conditions.shape}")
         
     def train_ldm(self):
         """训练LDM，基于encoder的embeddings"""
@@ -257,15 +251,10 @@ class UnifiedTrainer:
         
         # 根据条件类型获取条件数据
         conditions = self.conditions
-        condition_type = getattr(self.args, 'condition_type', 'kmeans')
+        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
         
         print(f"训练数据: {self.training_embeddings.shape[0]} 个embeddings")
-        if condition_type == 'kmeans':
-            print(f"条件数据: {conditions.shape[0]} 个条件（基于{self.args.train_classes_num}个聚类中心）")
-        elif condition_type == 'self_conditioning':
-            print(f"条件数据: {conditions.shape[0]} 个条件（使用样本自己作为条件）")
-        else:
-            print(f"条件数据: {conditions.shape[0]} 个条件")
+        print(f"条件数据: {conditions.shape[0]} 个条件")
         
         decay = float(getattr(self.args, 'ldm_ema_decay', 0.9))
         check_interval = int(getattr(self.args, 'ldm_es_interval', 20))
@@ -411,7 +400,7 @@ class UnifiedTrainer:
             # 根据测试类型记录不同的日志信息
             if self.logf is not None:
                 if use_ldm_augmentation:
-                    self.logf.write(f"任务起始索引 {start_test_idx} 微调后准确率: {test_acc:.4f}\n")
+                    self.logf.write(f"任务起始索引 {start_test_idx} 扩充数据后准确率: {test_acc:.4f}\n")
                 else:
                     self.logf.write(f"任务起始索引 {start_test_idx} 原始准确率: {test_acc:.4f}\n")
             
@@ -420,7 +409,7 @@ class UnifiedTrainer:
             # 使用tqdm.write显示任务准确率
             task_num = len(test_accs)
             if use_ldm_augmentation:
-                pbar.write(f"任务 {task_num}: 微调后准确率 = {test_acc:.4f}")
+                pbar.write(f"任务 {task_num}: 扩充数据后准确率 = {test_acc:.4f}")
             else:
                 pbar.write(f"任务 {task_num}: 原始准确率 = {test_acc:.4f}")
             
@@ -491,47 +480,80 @@ class UnifiedTrainer:
             task_id = f"task_{start_test_idx // (self.args.N_way * self.args.query_size)}"
             self._task_level_finetune(original_support_data, support_label, task_id=task_id)
 
-
+        # 初始化变量
+        augmented_embeddings = []
+        augmented_labels = []
         
         # 使用LDM生成增强的embeddings（仅在需要时）
         if num_augmented_samples > 0:
-            augmented_embeddings = []
-            augmented_labels = []
+            # 根据条件类型选择生成策略
+            condition_type = getattr(self.args, 'condition_type', 'self_labeling')
             
-            # 为每个支持集样本生成增强样本
-            for i in range(len(original_support_data)):
-                # 使用支持集样本自己作为条件
-                support_sample = original_support_data[i:i+1]  # [1, D]
-                support_sample_label = support_label[i:i+1]    # [1]
+            if condition_type == 'class_proto':
+                # 测试阶段：使用真实标签聚类生成类别原型
+                unique_labels = torch.unique(support_label)
+                label_prototypes = {}
                 
-                # 归一化条件
-                condition = F.normalize(support_sample, dim=1)
-                condition = condition.repeat(num_augmented_samples, 1)  # [num_aug, D]
+                # 为每个类别计算原型
+                for label in unique_labels:
+                    label_mask = (support_label == label)
+                    if label_mask.sum() > 0:
+                        label_embs = original_support_data[label_mask]
+                        prototype = F.normalize(label_embs.mean(dim=0, keepdim=True), dim=1)
+                        label_prototypes[label.item()] = prototype
                 
-                # 使用LDM生成新的embeddings
-                with torch.no_grad():
-                    generated_embeddings = self.ldm.sample(
-                        shape=(num_augmented_samples, self.training_embeddings.shape[1]),
-                        cond=condition,
-                        control=condition  # 使用条件作为control信号
-                    )  # [num_samples, D]
+                # 为每个支持集样本生成增强样本
+                for i in range(len(original_support_data)):
+                    support_sample_label = support_label[i:i+1]
+                    label_key = support_sample_label.item()
                     
-                augmented_embeddings.append(generated_embeddings)
-                augmented_labels.extend([support_sample_label.item()] * num_augmented_samples)
-            
-            # 合并原始和增强的embeddings
-            if augmented_embeddings:
-                all_augmented_embs = torch.cat(augmented_embeddings, dim=0)
-                all_augmented_labels = torch.tensor(augmented_labels, device=self.args.device, dtype=torch.long)
-                
-                # 合并支持集
-                enhanced_support_data = torch.cat([original_support_data, all_augmented_embs], dim=0)
-                enhanced_support_labels = torch.cat([support_label, all_augmented_labels], dim=0)
+                    if label_key in label_prototypes:
+                        # 使用类别原型作为条件
+                        prototype_condition = label_prototypes[label_key]
+                        repeated_condition = prototype_condition.repeat(num_augmented_samples, 1)
+                        
+                        # 使用LDM生成新的embeddings
+                        with torch.no_grad():
+                            generated_embeddings = self.ldm.sample(
+                                shape=(num_augmented_samples, self.training_embeddings.shape[1]),
+                                cond=repeated_condition,
+                                control=repeated_condition
+                            )
+                            
+                        augmented_embeddings.append(generated_embeddings)
+                        augmented_labels.extend([label_key] * num_augmented_samples)
+                    else:
+                        print(f"警告：标签 {label_key} 没有对应的原型")
             else:
-                enhanced_support_data = original_support_data
-                enhanced_support_labels = support_label
+                # 其他条件类型：使用样本自己作为条件
+                for i in range(len(original_support_data)):
+                    support_sample = original_support_data[i:i+1]
+                    support_sample_label = support_label[i:i+1]
+                    
+                    # 归一化条件
+                    condition = F.normalize(support_sample, dim=1)
+                    condition = condition.repeat(num_augmented_samples, 1)
+                    
+                    # 使用LDM生成新的embeddings
+                    with torch.no_grad():
+                        generated_embeddings = self.ldm.sample(
+                            shape=(num_augmented_samples, self.training_embeddings.shape[1]),
+                            cond=condition,
+                            control=condition
+                        )
+                        
+                    augmented_embeddings.append(generated_embeddings)
+                    augmented_labels.extend([support_sample_label.item()] * num_augmented_samples)
+        
+        # 合并原始和增强的embeddings
+        if augmented_embeddings:
+            all_augmented_embs = torch.cat(augmented_embeddings, dim=0)
+            all_augmented_labels = torch.tensor(augmented_labels, device=self.args.device, dtype=torch.long)
+            
+            # 合并支持集
+            enhanced_support_data = torch.cat([original_support_data, all_augmented_embs], dim=0)
+            enhanced_support_labels = torch.cat([support_label, all_augmented_labels], dim=0)
         else:
-            # 无LDM增强，直接使用原始数据
             enhanced_support_data = original_support_data
             enhanced_support_labels = support_label
             
@@ -600,15 +622,40 @@ class UnifiedTrainer:
                 p.requires_grad = True
                 trainable.append(p)
 
-        # 2) 自条件（与训练阶段一致：先归一化）
+        # 2) 根据条件类型选择条件策略
+        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
+        
         with torch.no_grad():
-            cond_per_sample = F.normalize(support_data, dim=1)
-            
-            # 构造类原型作为control信号（更稳定）
-            uniq = torch.unique(support_labels)
-            ns = F.normalize(support_data, dim=1)
-            proto = {int(lbl): F.normalize(ns[support_labels==lbl].mean(0, keepdim=True), dim=1) for lbl in uniq}
-            control_in = torch.cat([proto[int(lbl)] for lbl in support_labels.tolist()], dim=0)
+            if condition_type == 'class_proto':
+                # 测试阶段：使用真实标签聚类生成类别原型
+                unique_labels = torch.unique(support_labels)
+                label_prototypes = {}
+                
+                # 为每个类别计算原型
+                for label in unique_labels:
+                    label_mask = (support_labels == label)
+                    if label_mask.sum() > 0:
+                        label_embs = support_data[label_mask]
+                        prototype = F.normalize(label_embs.mean(dim=0, keepdim=True), dim=1)
+                        label_prototypes[label.item()] = prototype
+                
+                # 为每个样本分配对应的类别原型
+                cond_per_sample = torch.zeros_like(support_data)
+                for i, label in enumerate(support_labels):
+                    label_key = label.item()
+                    if label_key in label_prototypes:
+                        cond_per_sample[i] = label_prototypes[label_key]
+                    else:
+                        # 如果没有原型，使用样本自己
+                        cond_per_sample[i] = F.normalize(support_data[i:i+1], dim=1).squeeze(0)
+                
+                # 控制信号使用类别原型
+                control_in = cond_per_sample.clone()
+                
+            else:
+                # 其他条件类型：使用样本自己作为条件
+                cond_per_sample = F.normalize(support_data, dim=1)
+                control_in = cond_per_sample.clone()
 
         # 3) 优化器（仅本地使用）
         lr = float(getattr(self.args, 'task_finetune_lr', 1e-4))  # 降低学习率
@@ -751,17 +798,16 @@ class UnifiedTrainer:
         self.ldm.eval()
         
         # 检查条件类型
-        condition_type = getattr(self.args, 'condition_type', 'kmeans')
+        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
         
         # 根据条件类型决定生成策略
-        if condition_type == 'kmeans':
+        if condition_type == 'class_proto':
             # 使用聚类原型生成
             if not hasattr(self, 'prototypes') or self.prototypes is None:
                 print("❌ 错误：未找到聚类原型，请先运行 collect_training_embeddings()")
                 return
                 
             num_prototypes = self.prototypes.shape[0]
-            print(f"找到 {num_prototypes} 个聚类原型")
             
             # 存储生成的样本
             generated_samples = []
@@ -770,8 +816,6 @@ class UnifiedTrainer:
             # 为每个原型生成样本
             with torch.no_grad():
                 for proto_idx in range(num_prototypes):
-                    print(f"正在为原型 {proto_idx + 1}/{num_prototypes} 生成 {num_samples_per_prototype} 个样本...")
-                    
                     # 获取当前原型作为条件
                     prototype_condition = self.prototypes[proto_idx:proto_idx+1]  # [1, D]
                     
@@ -797,62 +841,56 @@ class UnifiedTrainer:
             prototype_labels = np.array(prototype_labels)
             
             # 创建包含三种点的单一可视化图
-            self._visualize_three_types(
-                training_embeddings=self.training_embeddings.cpu(),
-                prototypes=self.prototypes.cpu(),
-                generated_embeddings=all_generated,
-                prototype_labels=prototype_labels,
-                save_path=save_path
-            )
+            if condition_type == 'class_proto':
+                self._visualize_three_types(
+                    training_embeddings=self.training_embeddings.cpu(),
+                    prototypes=self.prototypes.cpu(),
+                    generated_embeddings=all_generated,
+                    prototype_labels=prototype_labels,
+                    save_path=save_path
+                )
+            else:  # self_labeling
+                self._visualize_three_types(
+                    training_embeddings=self.training_embeddings.cpu(),
+                    prototypes=None,  # self_labeling没有原型
+                    generated_embeddings=all_generated,
+                    prototype_labels=sample_labels,
+                    save_path=save_path
+                )
             
-        elif condition_type == 'self_conditioning':
-            # 使用self-conditioning生成
-            print("使用self-conditioning模式生成样本")
-            
-            # 在可视化时重新计算kmeans聚类，用于生成样本
-            print("重新计算kmeans聚类用于可视化生成...")
-            kmeans = KMeans(n_init=10, n_clusters=self.args.train_classes_num, random_state=42)
-            cluster_labels = kmeans.fit_predict(self.training_embeddings.cpu().detach().numpy())
-            visualization_prototypes = torch.tensor(
-                kmeans.cluster_centers_, dtype=torch.float, device=self.args.device
-            )
-            
-            # 使用聚类原型生成样本
-            num_prototypes = visualization_prototypes.shape[0]
-            print(f"可视化聚类完成，找到 {num_prototypes} 个原型")
+        elif condition_type == 'self_labeling':
+            # 使用self-labeling生成：每个样本使用自己作为条件
             
             # 存储生成的样本
             generated_samples = []
-            prototype_labels = []
+            sample_labels = []
             
-            # 为每个原型生成样本
+            # 为每个训练样本生成样本
             with torch.no_grad():
-                for proto_idx in range(num_prototypes):
-                    print(f"正在为原型 {proto_idx + 1}/{num_prototypes} 生成 {num_samples_per_prototype} 个样本...")
-                    
-                    # 获取当前原型作为条件
-                    prototype_condition = visualization_prototypes[proto_idx:proto_idx+1]  # [1, D]
+                for i in range(len(self.training_embeddings)):
+                    # 使用样本自己作为条件
+                    sample_condition = self.training_embeddings[i:i+1]  # [1, D]
                     
                     # 归一化条件
-                    prototype_condition = F.normalize(prototype_condition, dim=1)
+                    sample_condition = F.normalize(sample_condition, dim=1)
                     
                     # 重复条件以生成多个样本
-                    repeated_condition = prototype_condition.repeat(num_samples_per_prototype, 1)  # [num_samples, D]
+                    repeated_condition = sample_condition.repeat(num_samples_per_prototype, 1)  # [num_samples, D]
                     
                     # 使用LDM生成样本
                     generated_embeddings = self.ldm.sample(
                         shape=(num_samples_per_prototype, self.training_embeddings.shape[1]),
                         cond=repeated_condition,
-                        control=repeated_condition  # 使用原型作为control信号
+                        control=repeated_condition  # 使用样本自己作为control信号
                     )  # [num_samples, D]
                     
-                    # 存储生成的样本和对应的原型标签
+                    # 存储生成的样本和对应的样本索引
                     generated_samples.append(generated_embeddings.cpu())
-                    prototype_labels.extend([proto_idx] * num_samples_per_prototype)
+                    sample_labels.extend([i] * num_samples_per_prototype)
             
             # 合并所有生成的样本
             all_generated = torch.cat(generated_samples, dim=0)  # [total_samples, D]
-            prototype_labels = np.array(prototype_labels)
+            sample_labels = np.array(sample_labels)
             
             # 创建包含三种点的单一可视化图
             self._visualize_three_types(
@@ -865,9 +903,6 @@ class UnifiedTrainer:
             
         else:
             raise ValueError(f"不支持的condition_type: {condition_type}")
-        
-        print(f"总共生成了 {all_generated.shape[0]} 个样本")
-        print("✅ 原型引导生成和可视化完成！")
         
         return all_generated, prototype_labels
     
@@ -886,8 +921,6 @@ class UnifiedTrainer:
             from sklearn.manifold import TSNE
             import matplotlib.pyplot as plt
             import seaborn as sns
-            
-            print(f"正在进行TSNE降维可视化...")
             
             # 合并所有数据用于TSNE降维
             all_embeddings = torch.cat([training_embeddings, prototypes, generated_embeddings], dim=0)
@@ -985,7 +1018,6 @@ class UnifiedTrainer:
         self.ldm.eval()
         
         # 1. 获取支持集embeddings（所有任务都一样的）
-        print("获取支持集embeddings...")
         support_task = self.dataset.sample_one_task(
             self.dataset.test_tasks, 
             np.array(list(range(self.dataset.test_classes_num))),
@@ -1011,19 +1043,7 @@ class UnifiedTrainer:
             support_labels.append(np.array([graph.label for graph in graphs[:self.args.K_shot]]))
         support_labels = torch.LongTensor(np.hstack(support_labels)).to(self.args.device)
         
-        # 调试信息：打印支持集详细信息
-        print(f"支持集详细信息:")
-        print(f"  - 支持集embeddings形状: {support_embeddings.shape}")
-        print(f"  - 支持集标签形状: {support_labels.shape}")
-        print(f"  - 支持集标签内容: {support_labels.tolist()}")
-        print(f"  - 唯一标签: {torch.unique(support_labels).tolist()}")
-        print(f"  - 每个标签的样本数:")
-        for label in torch.unique(support_labels):
-            count = (support_labels == label).sum().item()
-            print(f"    标签 {label.item()}: {count} 个样本")
-        
         # 2. 获取剩余测试数据embeddings
-        print("获取剩余测试数据embeddings...")
         remaining_test_embeddings = []
         remaining_test_labels = []
         
@@ -1053,31 +1073,83 @@ class UnifiedTrainer:
             remaining_test_embeddings = torch.empty(0, support_embeddings.shape[1])
             remaining_test_labels = torch.empty(0, dtype=torch.long)
         
-        # 3. 使用生成模型扩充数据
-        print("使用生成模型扩充数据...")
+        # 3. 先进行任务级微调，然后再生成样本
+        
+        # 任务前备份LDM权重，避免任务间串扰
+        _ldm_backup = deepcopy(self.ldm.state_dict())
+        
+        # 进行任务级微调
+        if getattr(self.args, 'task_finetune_steps', 0) > 0:
+            # 使用任务索引生成任务ID用于进度条显示
+            task_id = "visualization_task"
+            self._task_level_finetune(support_embeddings, support_labels, task_id=task_id)
+        
+        # 使用微调后的LDM生成样本
         augmented_embeddings = []
         augmented_labels = []
         
-        # 为每个支持集样本生成增强样本
-        for i in range(len(support_embeddings)):
-            # 使用支持集样本自己作为条件
-            support_sample = support_embeddings[i:i+1]  # [1, D]
-            support_sample_label = support_labels[i:i+1]    # [1]
+        # 根据条件类型选择生成策略
+        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
+        
+        if condition_type == 'class_proto':
+            # 测试阶段：使用真实标签聚类生成类别原型
+            unique_labels = torch.unique(support_labels)
+            label_prototypes = {}
             
-            # 归一化条件
-            condition = F.normalize(support_sample, dim=1)
-            condition = condition.repeat(num_samples_per_prototype, 1)  # [num_aug, D]
+            # 为每个类别计算原型
+            for label in unique_labels:
+                label_mask = (support_labels == label)
+                if label_mask.sum() > 0:
+                    label_embs = support_embeddings[label_mask]
+                    prototype = F.normalize(label_embs.mean(dim=0, keepdim=True), dim=1)
+                    label_prototypes[label.item()] = prototype
             
-            # 使用LDM生成新的embeddings
-            with torch.no_grad():
-                generated_embeddings = self.ldm.sample(
-                    shape=(num_samples_per_prototype, support_embeddings.shape[1]),
-                    cond=condition,
-                    control=condition  # 使用条件作为control信号
-                )  # [num_samples, D]
+            # 为每个支持集样本生成增强样本
+            for i in range(len(support_embeddings)):
+                support_sample_label = support_labels[i:i+1]
+                label_key = support_sample_label.item()
                 
-            augmented_embeddings.append(generated_embeddings)
-            augmented_labels.extend([support_sample_label.item()] * num_samples_per_prototype)
+                if label_key in label_prototypes:
+                    # 使用类别原型作为条件
+                    prototype_condition = label_prototypes[label_key]
+                    repeated_condition = prototype_condition.repeat(num_samples_per_prototype, 1)
+                    
+                    # 使用微调后的LDM生成新的embeddings
+                    with torch.no_grad():
+                        generated_embeddings = self.ldm.sample(
+                            shape=(num_samples_per_prototype, support_embeddings.shape[1]),
+                            cond=repeated_condition,
+                            control=repeated_condition
+                        )
+                        
+                    augmented_embeddings.append(generated_embeddings)
+                    augmented_labels.extend([label_key] * num_samples_per_prototype)
+                else:
+                    print(f"警告：标签 {label_key} 没有对应的原型")
+        else:
+            # 其他条件类型：使用样本自己作为条件
+            for i in range(len(support_embeddings)):
+                support_sample = support_embeddings[i:i+1]
+                support_sample_label = support_labels[i:i+1]
+                
+                # 归一化条件
+                condition = F.normalize(support_sample, dim=1)
+                condition = condition.repeat(num_samples_per_prototype, 1)
+                
+                # 使用微调后的LDM生成新的embeddings
+                with torch.no_grad():
+                    generated_embeddings = self.ldm.sample(
+                        shape=(num_samples_per_prototype, support_embeddings.shape[1]),
+                        cond=condition,
+                        control=condition
+                    )
+                    
+                augmented_embeddings.append(generated_embeddings)
+                augmented_labels.extend([support_sample_label.item()] * num_samples_per_prototype)
+        
+        # 恢复LDM权重，避免影响后续操作
+        self.ldm.load_state_dict(_ldm_backup)
+        print("已恢复LDM原始权重")
         
         if augmented_embeddings:
             all_augmented_embs = torch.cat(augmented_embeddings, dim=0)
@@ -1087,7 +1159,6 @@ class UnifiedTrainer:
             all_augmented_labels = torch.empty(0, dtype=torch.long)
         
         # 4. 创建可视化
-        print("创建可视化...")
         self._visualize_support_query_generation(
             support_embeddings=support_embeddings.cpu(),
             support_labels=support_labels.cpu(),
@@ -1097,11 +1168,6 @@ class UnifiedTrainer:
             generated_labels=all_augmented_labels.cpu(),
             save_path=save_path
         )
-        
-        print(f"✅ 支持集、测试数据和生成数据的可视化完成！")
-        print(f"支持集样本数: {len(support_embeddings)}")
-        print(f"剩余测试样本数: {len(remaining_test_embeddings)}")
-        print(f"生成样本数: {len(all_augmented_embs)}")
         
         return support_embeddings, remaining_test_embeddings, all_augmented_embs
     
@@ -1124,8 +1190,6 @@ class UnifiedTrainer:
             from sklearn.manifold import TSNE
             import matplotlib.pyplot as plt
             import seaborn as sns
-            
-            print(f"正在进行TSNE降维可视化...")
             
             # 合并所有数据用于TSNE降维
             all_embeddings = torch.cat([support_embeddings, remaining_test_embeddings, generated_embeddings], dim=0)
@@ -1152,7 +1216,6 @@ class UnifiedTrainer:
             color_map = {label.item(): colors[i] for i, label in enumerate(unique_labels)}
             
             # 1. 绘制支持集点（实心圆点，较大，按标签使用不同颜色）
-            print(f"绘制支持集点: 总共 {len(support_2d)} 个点")
             for i, (emb_2d, label) in enumerate(zip(support_2d, support_labels)):
                 color = color_map[label.item()]
                 plt.scatter(
@@ -1161,8 +1224,6 @@ class UnifiedTrainer:
                     label=f'Support (L{label.item()})' if i == 0 or label != support_labels[i-1] else "",
                     edgecolors='black', linewidth=1, marker='o'
                 )
-                # 打印每一个点的详细信息
-                print(f"  点 {i:2d}: 位置({emb_2d[0]:8.3f}, {emb_2d[1]:8.3f}), 标签{label.item()}")
             
             # 2. 绘制剩余测试数据点（实心方块，中等大小，按标签使用不同颜色）
             for i, (emb_2d, label) in enumerate(zip(remaining_2d, remaining_test_labels)):

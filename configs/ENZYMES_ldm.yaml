@@ -43,8 +43,8 @@ beta_end: 0.02
 ldm_batch_size: 64
 
 # 条件类型配置
-# condition_type: kmeans  # 使用KMeans聚类作为条件
-condition_type: self_conditioning  # 使用样本自己作为条件
+# condition_type: self_labeling  # 所有阶段都使用样本自己作为条件
+condition_type: class_proto  # 训练时使用K-means，其他阶段使用真实标签聚类
 
 # 数据增强参数
 num_augmented_samples: 10
