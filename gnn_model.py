@@ -5,6 +5,7 @@ import torch.nn as nn
 from functools import reduce
 from operator import mul
 import torch.nn.functional as F
+from torch_scatter import scatter_mean, scatter_max
 
 class MLP(nn.Module):
     def __init__(self, num_layers, input_dim, hidden_dim, output_dim):
@@ -64,7 +65,7 @@ class GraphCNN(nn.Module):
             final_dropout: dropout ratio on the final linear layer
             learn_eps: If True, learn epsilon to distinguish center nodes from neighboring nodes. If False, aggregate neighbors and center nodes altogether.
             neighbor_pooling_type: how to aggregate neighbors (mean, average, or max)
-            graph_pooling_type: how to aggregate entire nodes in a graph (mean, average)
+            graph_pooling_type: how to aggregate entire nodes in a graph (sum, average, max, meanmax, maxavg_concat)
             device: which device to use
         '''
 
@@ -211,6 +212,15 @@ class GraphCNN(nn.Module):
 
         return graph_pool.to(self.device)
 
+    def __build_batch_index(self, batch_graph):
+        # 为每个节点生成其所属图的编号 [total_nodes,]
+        idx = []
+        for i, graph in enumerate(batch_graph):
+            n = len(graph.g)  # 当前图的节点数
+            idx.append(torch.full((n,), i, dtype=torch.long))
+        batch_index = torch.cat(idx, dim=0).to(self.device)
+        return batch_index
+
     def next_layer_eps(self, h, layer, padded_neighbor_list=None, Adj_block=None):
         ###pooling neighboring nodes and center nodes separately by epsilon reweighting.
 
@@ -256,9 +266,29 @@ class GraphCNN(nn.Module):
 
         pooled_h_layers = []
 
+        # 为 scatter 构造 batch_index（只构造一次，后续多层复用）
+        batch_index = self.__build_batch_index(batch_graph)
+        num_graphs = len(batch_graph)
+
         # perform pooling over all nodes in each graph in every layer
         for layer, h in enumerate(hidden_rep):
-            pooled_h = torch.spmm(graph_pool, h)
+            if self.graph_pooling_type in ("sum", "average"):
+                # 原有稀疏矩阵路径保持不变
+                pooled_h = torch.spmm(graph_pool, h)
+
+            elif self.graph_pooling_type == "max":
+                # 使用 torch_scatter 进行按图的逐维最大池化
+                pooled_h = scatter_max(h, batch_index, dim=0, dim_size=num_graphs)[0]
+
+            elif self.graph_pooling_type in ("meanmax", "maxavg_concat"):
+                # 使用 torch_scatter 分别做 mean 和 max，然后在最后一维拼接
+                mean_h = scatter_mean(h, batch_index, dim=0, dim_size=num_graphs)
+                max_h  = scatter_max (h, batch_index, dim=0, dim_size=num_graphs)[0]
+                pooled_h = torch.cat([mean_h, max_h], dim=-1)
+
+            else:
+                raise ValueError(f"Unknown graph_pooling_type: {self.graph_pooling_type}")
+
             pooled_h_layers.append(pooled_h)
 
         return pooled_h_layers, h, Adj_block_idx, hidden_rep, final_hidd
@@ -286,9 +316,20 @@ class Model(nn.Module):
 
         self.sample_input_emb_size = args.sample_input_size
 
+        # 安全地获取 graph_pooling_type，如果不存在则默认为 'sum'
+        graph_pooling_type = getattr(self.args, 'graph_pooling_type', 'sum')
+        
         self.gin = GraphCNN(input_dim=args.node_fea_size, use_select_sim=args.use_select_sim, num_layers=args.gin_layer,
-                            hidden_dim=args.gin_hid, device=self.device).to(self.device)  # .cuda()
+                            hidden_dim=args.gin_hid, graph_pooling_type=graph_pooling_type, device=self.device).to(self.device)  # .cuda()
 
+        # === 自动推断 pooled 表征总维度，避免手动改 sample_input_size ===
+        per_layer_dim = self.hid  # 每层GIN输出通道
+        
+        if graph_pooling_type in ("meanmax", "maxavg_concat"):
+            per_layer_dim *= 2  # mean+max 拼接
+        self.sample_input_emb_size = per_layer_dim * (self.args.gin_layer - 1)
+
+        # 按自动推断结果重建 proj_head
         self.proj_head = nn.Sequential(nn.Linear(self.sample_input_emb_size, self.hid), nn.ReLU(inplace=True),
                                        nn.Linear(self.hid, self.hid))  # whether to use the batchnorm1d?
 

@@ -42,6 +42,10 @@ beta_start: 0.0001
 beta_end: 0.02
 ldm_batch_size: 64
 
+# 条件类型配置
+# condition_type: kmeans  # 使用KMeans聚类作为条件
+condition_type: self_conditioning  # 使用样本自己作为条件
+
 # 数据增强参数
 num_augmented_samples: 10
 batch_size_for_embedding: 32

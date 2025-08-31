@@ -2,3 +2,4 @@ datasets/*
 *.pyc
 savepoint/*
 our_results/*
+wandb/*
