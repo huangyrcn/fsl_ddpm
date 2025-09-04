@@ -2,11 +2,11 @@
 dataset_name: Letter_high
 baseline_mode: null
 N_way: 4
-K_shot: 5
+K_shot: 10
 query_size: 10
-patience: 50
+patience: 5
 dropout: 0.5
-batch: 512
+batch: 128
 gin_layer: 3
 gin_hid: 128
 aug1: node_drop
@@ -35,7 +35,7 @@ use_pretrained_encoder: true
 encoder_ckpt_path: ./savepoint/Letter_high_encoder.pkl
 # LDM增强配置
 use_ldm_augmentation: true
-use_pretrained_ldm: false  # 是否跳过LDM训练并从ckpt加载
+use_pretrained_ldm: true # 是否跳过LDM训练并从ckpt加载
 ldm_ckpt_path: ./savepoint/Letter_high_ldm.pkl  # 预训练LDM权重（state_dict）
 
 # LDM相关参数  
@@ -43,22 +43,23 @@ learning_rate_ldm: 1e-4
 weight_decay_ldm: 1.0e-04
 num_epochs_ldm: 200000
 patience_ldm: 200
-time_steps: 500
+time_steps: 50
 beta_start: 0.0001
-beta_end: 0.02
+beta_end: 0.02 
 ldm_batch_size: 512
 ldm_ema_decay: 0.9              # LDM训练EMA衰减
 ldm_es_interval: 100             # LDM早停检查间隔（与打印间隔一致）
 
 # 条件类型配置
 # condition_type: self_labeling  # 所有阶段都使用样本自己作为条件
-condition_type: self_labeling  # 训练时使用K-means，其他阶段使用真实标签聚类
+condition_type: class_proto  # 训练时使用K-means，其他阶段使用真实标签聚类
 
 # 数据增强参数
 # 每个支持集样本生成的增强样本数量
 # 策略：使用支持集样本作为条件，每个样本生成num_augmented_samples个增强样本
-num_augmented_samples: 30
+num_augmented_samples: 1
 
+#可视化处理的batch
 batch_size_for_embedding: 512
 
 # 任务级微调参数
@@ -70,6 +71,11 @@ task_finetune_snr_cap: 5.0   # 目前无效，留存即可
 task_finetune_grad_clip: 1.0
 task_finetune_patience: 6000
 
+# 嵌入修饰参数
+# 支持集修饰控制
+refine_support_before_training: true
+refine_alpha: 0.9
+refine_use_slerp: false
 
 
 

@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -174,15 +175,15 @@ class UnifiedTrainer:
         self.ldm = LDM(
             self.args.device,
             embedding_dim,  # 使用encoder的输出维度
-            getattr(self.args, 'time_steps', 100),
-            getattr(self.args, 'beta_start', 0.0001),
-            getattr(self.args, 'beta_end', 0.02)
+            self.args.time_steps,
+            self.args.beta_start,
+            self.args.beta_end
         ).to(self.args.device)
         
         self.ldm_optimizer = torch.optim.AdamW(
             self.ldm.parameters(),
-            lr=getattr(self.args, 'learning_rate_ldm', 0.001),
-            weight_decay=getattr(self.args, 'weight_decay_ldm', 1e-4)
+            lr=self.args.learning_rate_ldm,
+            weight_decay=self.args.weight_decay_ldm
         )
         
         print("LDM组件初始化完成!")
@@ -217,7 +218,7 @@ class UnifiedTrainer:
             self.training_labels = torch.tensor([graph.label for graph in all_graphs], device=self.args.device)
     
         # 根据参数选择条件类型
-        condition_type = getattr(self.args, 'condition_type', 'self_labeling')  # 默认为self_labeling
+        condition_type = self.args.condition_type  # 默认为self_labeling
         
         if condition_type == 'self_labeling':
             # 使用样本自己作为条件
@@ -226,11 +227,15 @@ class UnifiedTrainer:
             
         elif condition_type == 'class_proto':
             # 训练阶段：使用K-means聚类获取类别原型
+            # 先归一化embeddings，再进行聚类
+            normalized_embeddings = F.normalize(self.training_embeddings, dim=1)
             kmeans = KMeans(n_init=10, n_clusters=self.args.train_classes_num, random_state=42)
-            cluster_labels = kmeans.fit_predict(self.training_embeddings.cpu().detach().numpy())
+            cluster_labels = kmeans.fit_predict(normalized_embeddings.cpu().detach().numpy())
             prototypes = torch.tensor(
                 kmeans.cluster_centers_, dtype=torch.float, device=self.args.device
             )
+            # 对聚类中心再次归一化
+            prototypes = F.normalize(prototypes, dim=1)
             self.prototypes = prototypes
 
             # 计算每个样本的类别 Prototype 作为条件
@@ -251,20 +256,20 @@ class UnifiedTrainer:
         
         # 根据条件类型获取条件数据
         conditions = self.conditions
-        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
+        condition_type = self.args.condition_type
         
         print(f"训练数据: {self.training_embeddings.shape[0]} 个embeddings")
         print(f"条件数据: {conditions.shape[0]} 个条件")
         
-        decay = float(getattr(self.args, 'ldm_ema_decay', 0.9))
-        check_interval = int(getattr(self.args, 'ldm_es_interval', 20))
+        decay = float(self.args.ldm_ema_decay)
+        check_interval = int(self.args.ldm_es_interval)
         ema_loss = None
         best_ema = float('inf')
         patience_count = 0
         patience = self.args.patience_ldm
         
         # 创建进度条
-        pbar = tqdm(range(1, getattr(self.args, 'num_epochs_ldm', 200) + 1), desc="LDM Training")
+        pbar = tqdm(range(1, self.args.num_epochs_ldm + 1), desc="LDM Training")
         
         for epoch in pbar:
             # 随机打乱数据
@@ -273,7 +278,7 @@ class UnifiedTrainer:
             shuffled_conditions = conditions[perm]
             
             epoch_loss = 0
-            batch_size = getattr(self.args, 'ldm_batch_size', 64)
+            batch_size = self.args.ldm_batch_size
             num_batches = 0
             
             # 批训练
@@ -347,71 +352,56 @@ class UnifiedTrainer:
         
         return loss
         
-    def test_model(self, use_ldm_augmentation=True, test_name=None):
-        """统一的测试函数，支持原始Encoder和LDM增强两种模式
+
+
         
-        Args:
-            use_ldm_augmentation: 是否使用LDM增强
-            test_name: 测试名称，用于日志记录
-        """
-        if use_ldm_augmentation:
-            test_name = test_name or "LDM增强测试"
-            print(f"=== {test_name} ===")
-            print(f"任务级微调步数: {getattr(self.args, 'task_finetune_steps', 0)}，学习率: {getattr(self.args, 'task_finetune_lr', 0.0)}")
-            
-            # 加载最佳LDM模型
-            ldm_model_path = None
-            standard_path = os.path.join(self.save_dir, f'{self.args.dataset_name}_ldm.pkl')
-            if os.path.exists(standard_path):
-                ldm_model_path = standard_path
-                print("加载标准LDM模型")
-            
-            if ldm_model_path:
-                try:
-                    self.ldm.load_state_dict(torch.load(ldm_model_path, map_location=self.args.device, weights_only=True))
-                    print(f"LDM模型加载成功: {os.path.basename(ldm_model_path)}")
-                except Exception as e:
-                    print(f"LDM模型加载失败: {e}，使用当前模型状态")
+    def test_model(self, num_augmented_samples=0, refine_support_before_training=False, ldm_model=None, test_name=None):
+        """统一的测试函数"""
+        # 统一命名
+        test_name = test_name or ("LDM增强测试" if num_augmented_samples > 0 else "原始Encoder测试")
+        self.model.eval()
+
+        # 是否需要LDM：当需要refine或需要生成增强时
+        need_ldm = bool(refine_support_before_training or (num_augmented_samples > 0))
+
+        # 根据 refine/augmentation 情况，统一打印更清晰的评估模式
+        if need_ldm:
+            if refine_support_before_training and num_augmented_samples == 0:
+                mode_label = "仅Refine评估（无增强采样）"
+            elif num_augmented_samples > 0:
+                mode_label = f"LDM增强评估（每样本生成{num_augmented_samples}）"
             else:
-                print("未找到LDM模型文件，使用当前模型状态")
-            
-            self.model.eval()
-            self.ldm.eval()
-            num_augmented_samples = getattr(self.args, 'num_augmented_samples', 10)
+                mode_label = "LDM评估"
         else:
-            test_name = test_name or "原始Encoder测试"
-            print(f"=== {test_name} ===")
-            self.model.eval()
-            num_augmented_samples = 0
+            mode_label = "原始Encoder评估（无LDM）"
+
+        print(f"=== {mode_label} ===")
         
         test_accs = []
         start_test_idx = 0
         
         # 计算总任务数
-        total_tasks = (len(self.dataset.test_graphs) - self.args.K_shot * self.dataset.test_classes_num) // (self.args.N_way * self.args.query_size)
+        total_tasks = (len(self.dataset.test_graphs) - self.args.K_shot * self.args.test_classes_num) // (self.args.N_way * self.args.query_size)
         
         # 创建进度条
         pbar = tqdm(total=total_tasks, desc=test_name)
         
-        while start_test_idx < len(self.dataset.test_graphs) - self.args.K_shot * self.dataset.test_classes_num:
-            test_acc = self._evaluate_one_task_with_ldm(start_test_idx, num_augmented_samples, start_test_idx=start_test_idx)
+        # 确保只处理完整的任务，跳过不完整的最后一个任务
+        end_test_idx = start_test_idx + total_tasks * (self.args.N_way * self.args.query_size)
+        
+        while start_test_idx < end_test_idx:
+            test_acc = self._evaluate_one_task_with_ldm(start_test_idx, num_augmented_samples, ldm_model, refine_support_before_training, start_test_idx=start_test_idx)
             test_accs.append(test_acc)
             
             # 根据测试类型记录不同的日志信息
             if self.logf is not None:
-                if use_ldm_augmentation:
-                    self.logf.write(f"任务起始索引 {start_test_idx} 扩充数据后准确率: {test_acc:.4f}\n")
-                else:
-                    self.logf.write(f"任务起始索引 {start_test_idx} 原始准确率: {test_acc:.4f}\n")
+                self.logf.write(f"任务起始索引 {start_test_idx} {mode_label} 准确率: {test_acc:.4f}\n")
             
             start_test_idx += self.args.N_way * self.args.query_size
             
             # 使用tqdm.write显示任务准确率
             task_num = len(test_accs)
-            if use_ldm_augmentation:
-                pbar.write(f"任务 {task_num}: 扩充数据后准确率 = {test_acc:.4f}")
-            else:
-                pbar.write(f"任务 {task_num}: 原始准确率 = {test_acc:.4f}")
+            pbar.write(f"任务 {task_num}: {mode_label} = {test_acc:.4f}")
             
             # 更新进度条
             pbar.update(1)
@@ -424,7 +414,7 @@ class UnifiedTrainer:
         
         print(f'{test_name}准确率: {mean_acc:.4f} ± {std:.4f}')
         if self.logf is not None:
-            if use_ldm_augmentation:
+            if num_augmented_samples > 0:
                 self.logf.write(f'{test_name}准确率: {mean_acc:.4f} ± {std:.4f}\n')
             else:
                 self.logf.write(f'{test_name}准确率: {mean_acc:.4f} ± {std:.4f}\n')
@@ -433,22 +423,12 @@ class UnifiedTrainer:
     
 
         
-    def _evaluate_one_task_with_ldm(self, test_idx, num_augmented_samples, start_test_idx=None):
-        """评估一个few-shot任务（使用LDM增强）
-        
-        Args:
-            test_idx: 测试任务起始索引
-            num_augmented_samples: 每个类别生成的增强样本数量
-            start_test_idx: 全局测试起始索引，用于计算任务ID
-        """
+    def _evaluate_one_task_with_ldm(self, test_idx, num_augmented_samples, ldm_model, refine_support_before_training, start_test_idx=None):
+        """评估一个few-shot任务"""
         self.model.eval()
         
-        # 获取prompt embeddings
-        if self.args.use_prompt:
-            self.prompt.train()
-            prompt_embeds = self.prompt()
-        else:
-            prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.args.device)
+        # 获取prompt embeddings（评估期不使用 prompt，统一零向量）
+        prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.args.device)
             
         # 采样当前任务
         first_N_class_sample = np.array(list(range(self.dataset.test_classes_num)))
@@ -458,12 +438,16 @@ class UnifiedTrainer:
             test_start_idx=test_idx
         )
         
-        # 获取原始支持集embeddings
-        support_current_sample_input_embs, _ = self.model.sample_input_GNN(
-            [current_task], prompt_embeds, True
-        )
+        # 获取支持集embeddings并处理维度
+        support_current_sample_input_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, True)
+        total_support_samples = self.args.K_shot + self.args.gen_test_num
         
-        original_support_data = support_current_sample_input_embs.detach()
+        # 重塑支持集数据：只取前K_shot个样本
+        support_data = support_current_sample_input_embs.reshape(
+            self.args.N_way, total_support_samples, self.model.sample_input_emb_size
+        )[:, :self.args.K_shot, :].reshape(
+            self.args.N_way * self.args.K_shot, self.model.sample_input_emb_size
+        ).detach()
         
         # 获取支持集标签
         support_label = []
@@ -471,114 +455,42 @@ class UnifiedTrainer:
             support_label.append(np.array([graph.label for graph in graphs[:self.args.K_shot]]))
         support_label = torch.LongTensor(np.hstack(support_label)).to(self.args.device)
         
-        # 任务前备份LDM权重，避免任务间串扰
-        _ldm_backup = deepcopy(self.ldm.state_dict())
-
-        # 任务级微调：用支持集对LDM做少量步数的适配
-        if getattr(self.args, 'task_finetune_steps', 20) > 0 and num_augmented_samples > 0:
-            # 使用任务索引生成任务ID用于进度条显示
-            task_id = f"task_{start_test_idx // (self.args.N_way * self.args.query_size)}"
-            self._task_level_finetune(original_support_data, support_label, task_id=task_id)
-
-        # 初始化变量
-        augmented_embeddings = []
-        augmented_labels = []
-        
-        # 使用LDM生成增强的embeddings（仅在需要时）
-        if num_augmented_samples > 0:
-            # 根据条件类型选择生成策略
-            condition_type = getattr(self.args, 'condition_type', 'self_labeling')
-            
-            if condition_type == 'class_proto':
-                # 测试阶段：使用真实标签聚类生成类别原型
-                unique_labels = torch.unique(support_label)
-                label_prototypes = {}
-                
-                # 为每个类别计算原型
-                for label in unique_labels:
-                    label_mask = (support_label == label)
-                    if label_mask.sum() > 0:
-                        label_embs = original_support_data[label_mask]
-                        prototype = F.normalize(label_embs.mean(dim=0, keepdim=True), dim=1)
-                        label_prototypes[label.item()] = prototype
-                
-                # 为每个支持集样本生成增强样本
-                for i in range(len(original_support_data)):
-                    support_sample_label = support_label[i:i+1]
-                    label_key = support_sample_label.item()
-                    
-                    if label_key in label_prototypes:
-                        # 使用类别原型作为条件
-                        prototype_condition = label_prototypes[label_key]
-                        repeated_condition = prototype_condition.repeat(num_augmented_samples, 1)
-                        
-                        # 使用LDM生成新的embeddings
-                        with torch.no_grad():
-                            generated_embeddings = self.ldm.sample(
-                                shape=(num_augmented_samples, self.training_embeddings.shape[1]),
-                                cond=repeated_condition,
-                                control=repeated_condition
-                            )
-                            
-                        augmented_embeddings.append(generated_embeddings)
-                        augmented_labels.extend([label_key] * num_augmented_samples)
-                    else:
-                        print(f"警告：标签 {label_key} 没有对应的原型")
-            else:
-                # 其他条件类型：使用样本自己作为条件
-                for i in range(len(original_support_data)):
-                    support_sample = original_support_data[i:i+1]
-                    support_sample_label = support_label[i:i+1]
-                    
-                    # 归一化条件
-                    condition = F.normalize(support_sample, dim=1)
-                    condition = condition.repeat(num_augmented_samples, 1)
-                    
-                    # 使用LDM生成新的embeddings
-                    with torch.no_grad():
-                        generated_embeddings = self.ldm.sample(
-                            shape=(num_augmented_samples, self.training_embeddings.shape[1]),
-                            cond=condition,
-                            control=condition
-                        )
-                        
-                    augmented_embeddings.append(generated_embeddings)
-                    augmented_labels.extend([support_sample_label.item()] * num_augmented_samples)
-        
-        # 合并原始和增强的embeddings
-        if augmented_embeddings:
-            all_augmented_embs = torch.cat(augmented_embeddings, dim=0)
-            all_augmented_labels = torch.tensor(augmented_labels, device=self.args.device, dtype=torch.long)
-            
-            # 合并支持集
-            enhanced_support_data = torch.cat([original_support_data, all_augmented_embs], dim=0)
-            enhanced_support_labels = torch.cat([support_label, all_augmented_labels], dim=0)
+        # 第一步：refine支持集（如果启用）
+        if refine_support_before_training:
+            support_data_for_enhancement = self.refine_embeddings_with_ldm(
+                embeddings=support_data,
+                labels=support_label,
+                ldm_model=ldm_model,
+                alpha=self.args.refine_alpha,
+                use_slerp=self.args.refine_use_slerp,
+                batch_size=self.args.ldm_batch_size
+            )
         else:
-            enhanced_support_data = original_support_data
-            enhanced_support_labels = support_label
-            
-        # 训练分类器（使用增强的支持集）
-        in_dim = self.model.sample_input_emb_size
-        num_cls = self.args.N_way
-        self.log = LogReg(in_dim, num_cls).to(self.args.device)  # 重置分类头
-        
-        # 使用统一的训练函数；无mixup时传入空参数
-        empty_long = torch.empty(0, dtype=torch.long, device=self.args.device)
-        empty_float = torch.empty(0, dtype=torch.float32, device=self.args.device)
+            support_data_for_enhancement = support_data
+
+        # 扩充支持集
+        enhanced_support_data, enhanced_support_labels = self.generate_augmented_embeddings(
+            embeddings=support_data_for_enhancement,
+            labels=support_label,
+            num_to_generate=num_augmented_samples,
+            ldm_model=ldm_model,
+            device=self.args.device,
+            condition_type=self.args.condition_type
+        )
+
+        # 训练分类器
+        self.log = LogReg(self.model.sample_input_emb_size, self.args.N_way).to(self.args.device)
+        empty_tensor = torch.empty(0, dtype=torch.long, device=self.args.device)
         self._train_classifier(
-            enhanced_support_data,
-            None,
-            enhanced_support_labels,
-            empty_long,
-            empty_long,
-            empty_float
+            enhanced_support_data, None, enhanced_support_labels,
+            empty_tensor, empty_tensor, torch.empty(0, dtype=torch.float32, device=self.args.device)
         )
         
-        # 评估查询集（复用前面计算的prompt_embeds）
-        query_current_sample_input_embs, _ = self.model.sample_input_GNN(
-            [current_task], prompt_embeds, False
-        )
-        query_data = query_current_sample_input_embs.detach()
+        # 评估查询集
+        query_current_sample_input_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, False)
+        query_data = query_current_sample_input_embs.reshape(
+            self.args.N_way, self.args.query_size, self.model.sample_input_emb_size
+        ).reshape(self.args.N_way * self.args.query_size, self.model.sample_input_emb_size).detach()
         
         # 获取查询集标签
         query_label = []
@@ -586,22 +498,19 @@ class UnifiedTrainer:
             query_label.append(np.array([graph.label for graph in graphs]))
         query_label = torch.LongTensor(np.hstack(query_label)).to(self.args.device)
         
-        # 处理查询集长度（去除填充部分）
-        query_len = query_label.shape[0]
+        # 处理填充数据
         if current_task['append_count'] != 0:
+            query_len = query_label.shape[0]
             query_data = query_data[:query_len - current_task['append_count'], :]
             query_label = query_label[:query_len - current_task['append_count']]
-            
+        
         # 预测和计算准确率
         logits = self.log(query_data)
         preds = torch.argmax(logits, dim=1)
         acc = torch.sum(preds == query_label).float() / query_label.shape[0]
         
-        # 恢复LDM权重，避免任务间串扰
-        self.ldm.load_state_dict(_ldm_backup)
-        
         return acc.cpu().numpy()
-    
+
     def _task_level_finetune(self, support_data, support_labels, task_id=None):
         """任务级 LDM 微调：适配当前任务的简单微调
         
@@ -610,7 +519,7 @@ class UnifiedTrainer:
             support_labels: 支持集标签 [S]
             task_id: 任务ID，用于进度条显示
         """
-        steps = int(getattr(self.args, 'task_finetune_steps', 20))
+        steps = int(self.args.task_finetune_steps)
         if steps <= 0:
             return
 
@@ -623,7 +532,7 @@ class UnifiedTrainer:
                 trainable.append(p)
 
         # 2) 根据条件类型选择条件策略
-        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
+        condition_type = self.args.condition_type
         
         with torch.no_grad():
             if condition_type == 'class_proto':
@@ -636,7 +545,9 @@ class UnifiedTrainer:
                     label_mask = (support_labels == label)
                     if label_mask.sum() > 0:
                         label_embs = support_data[label_mask]
-                        prototype = F.normalize(label_embs.mean(dim=0, keepdim=True), dim=1)
+                        # 先归一化，再均值，再归一化
+                        normalized_embs = F.normalize(label_embs, dim=1)
+                        prototype = F.normalize(normalized_embs.mean(dim=0, keepdim=True), dim=1)
                         label_prototypes[label.item()] = prototype
                 
                 # 为每个样本分配对应的类别原型
@@ -658,15 +569,15 @@ class UnifiedTrainer:
                 control_in = cond_per_sample.clone()
 
         # 3) 优化器（仅本地使用）
-        lr = float(getattr(self.args, 'task_finetune_lr', 1e-4))  # 降低学习率
-        wd = float(getattr(self.args, 'task_finetune_weight_decay', 0.0))
+        lr = float(self.args.task_finetune_lr)  # 降低学习率
+        wd = float(self.args.task_finetune_weight_decay)
         opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
 
         self.ldm.train()
 
-        drop_p   = float(getattr(self.args, 'task_finetune_cond_dropout', 0.05))  # 降低dropout
-        grad_clip = float(getattr(self.args, 'task_finetune_grad_clip', 1.0))
-        patience  = int(getattr(self.args, 'task_finetune_patience', 5))
+        drop_p   = float(self.args.task_finetune_cond_dropout)  # 降低dropout
+        grad_clip = float(self.args.task_finetune_grad_clip)
+        patience  = int(self.args.task_finetune_patience)
 
         # 早停跟踪
         best_loss  = float('inf')
@@ -733,8 +644,9 @@ class UnifiedTrainer:
             
         # 早停相关变量
         best_loss = 1e9
+        best_state = None
         wait = 0
-        patience = 10
+        patience = 100
         
         for _ in range(500):
             opt.zero_grad()
@@ -764,524 +676,370 @@ class UnifiedTrainer:
             if loss_total < best_loss:
                 best_loss = loss_total
                 wait = 0
-                torch.save(
-                    self.log.state_dict(), 
-                    os.path.join(self.save_dir, f'{self.args.dataset_name}_lr.pkl')
-                )
+                # 直接在内存中保存最佳权重状态
+                best_state = deepcopy(self.log.state_dict())
             else:
                 wait += 1
             if wait > patience:
                 break
                 
-        # 加载最佳模型权重
-        self.log.load_state_dict(torch.load(
-            os.path.join(self.save_dir, f'{self.args.dataset_name}_lr.pkl'),
-            weights_only=True
-        ))
+        # 加载内存中的最佳权重
+        if best_state is not None:
+            self.log.load_state_dict(best_state)
         self.log.eval()
         
-    def visualize_prototype_generation(self, num_samples_per_prototype=50, save_path=None):
+ 
+    def generate_augmented_embeddings(self, embeddings: torch.Tensor, labels: torch.Tensor,
+                                      num_to_generate: int, *, ldm_model, device, condition_type: str):
+        """使用给定的 LDM 模型对输入嵌入进行扩充。
+        - embeddings: [N, D]
+        - labels:     [N]
+        - num_to_generate: 每类/每样本生成的样本数（由 condition_type 决定粒度）
+        - ldm_model:  采样用的 LDM 实例
+        - device:     目标设备
+        - condition_type: 'class_proto' 或 'self_labeling'
+        返回 (enhanced_embeddings, enhanced_labels)。当 num_to_generate<=0 原样返回。
         """
-        在LDM训练完成后，使用聚类原型作为条件生成样本并进行降维可视化
-        
-        Args:
-            num_samples_per_prototype: 每个原型生成的样本数量
-            save_path: 可视化图片保存路径，如果为None则显示图片
-        """
-        print("=== 开始原型引导生成和可视化 ===")
-        
-        if not hasattr(self, 'ldm'):
-            print("❌ 错误：未找到LDM模型，请先运行 init_ldm_components()")
-            return
-        
-        # 确保LDM处于评估模式
-        self.ldm.eval()
-        
-        # 检查条件类型
-        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
-        
-        # 根据条件类型决定生成策略
+        if num_to_generate <= 0:
+            return embeddings, labels
+
+        embedding_dim = embeddings.shape[1]
+
+        gen_batches: list[torch.Tensor] = []
+        gen_labels: list[int] = []
+
         if condition_type == 'class_proto':
-            # 使用聚类原型生成
-            if not hasattr(self, 'prototypes') or self.prototypes is None:
-                print("❌ 错误：未找到聚类原型，请先运行 collect_training_embeddings()")
-                return
-                
-            num_prototypes = self.prototypes.shape[0]
-            
-            # 存储生成的样本
-            generated_samples = []
-            prototype_labels = []
-            
-            # 为每个原型生成样本
-            with torch.no_grad():
-                for proto_idx in range(num_prototypes):
-                    # 获取当前原型作为条件
-                    prototype_condition = self.prototypes[proto_idx:proto_idx+1]  # [1, D]
-                    
-                    # 归一化条件
-                    prototype_condition = F.normalize(prototype_condition, dim=1)
-                    
-                    # 重复条件以生成多个样本
-                    repeated_condition = prototype_condition.repeat(num_samples_per_prototype, 1)  # [num_samples, D]
-                    
-                    # 使用LDM生成样本
-                    generated_embeddings = self.ldm.sample(
-                        shape=(num_samples_per_prototype, self.training_embeddings.shape[1]),
-                        cond=repeated_condition,
-                        control=repeated_condition  # 使用原型作为control信号
-                    )  # [num_samples, D]
-                    
-                    # 存储生成的样本和对应的原型标签
-                    generated_samples.append(generated_embeddings.cpu())
-                    prototype_labels.extend([proto_idx] * num_samples_per_prototype)
-            
-            # 合并所有生成的样本
-            all_generated = torch.cat(generated_samples, dim=0)  # [total_samples, D]
-            prototype_labels = np.array(prototype_labels)
-            
-            # 创建包含三种点的单一可视化图
-            if condition_type == 'class_proto':
-                self._visualize_three_types(
-                    training_embeddings=self.training_embeddings.cpu(),
-                    prototypes=self.prototypes.cpu(),
-                    generated_embeddings=all_generated,
-                    prototype_labels=prototype_labels,
-                    save_path=save_path
-                )
-            else:  # self_labeling
-                self._visualize_three_types(
-                    training_embeddings=self.training_embeddings.cpu(),
-                    prototypes=None,  # self_labeling没有原型
-                    generated_embeddings=all_generated,
-                    prototype_labels=sample_labels,
-                    save_path=save_path
-                )
-            
-        elif condition_type == 'self_labeling':
-            # 使用self-labeling生成：每个样本使用自己作为条件
-            
-            # 存储生成的样本
-            generated_samples = []
-            sample_labels = []
-            
-            # 为每个训练样本生成样本
-            with torch.no_grad():
-                for i in range(len(self.training_embeddings)):
-                    # 使用样本自己作为条件
-                    sample_condition = self.training_embeddings[i:i+1]  # [1, D]
-                    
-                    # 归一化条件
-                    sample_condition = F.normalize(sample_condition, dim=1)
-                    
-                    # 重复条件以生成多个样本
-                    repeated_condition = sample_condition.repeat(num_samples_per_prototype, 1)  # [num_samples, D]
-                    
-                    # 使用LDM生成样本
-                    generated_embeddings = self.ldm.sample(
-                        shape=(num_samples_per_prototype, self.training_embeddings.shape[1]),
-                        cond=repeated_condition,
-                        control=repeated_condition  # 使用样本自己作为control信号
-                    )  # [num_samples, D]
-                    
-                    # 存储生成的样本和对应的样本索引
-                    generated_samples.append(generated_embeddings.cpu())
-                    sample_labels.extend([i] * num_samples_per_prototype)
-            
-            # 合并所有生成的样本
-            all_generated = torch.cat(generated_samples, dim=0)  # [total_samples, D]
-            sample_labels = np.array(sample_labels)
-            
-            # 创建包含三种点的单一可视化图
-            self._visualize_three_types(
-                training_embeddings=self.training_embeddings.cpu(),
-                prototypes=visualization_prototypes.cpu(),
-                generated_embeddings=all_generated,
-                prototype_labels=prototype_labels,
-                save_path=save_path
-            )
-            
-        else:
-            raise ValueError(f"不支持的condition_type: {condition_type}")
-        
-        return all_generated, prototype_labels
-    
-    def _visualize_three_types(self, training_embeddings, prototypes, generated_embeddings, prototype_labels, save_path=None):
-        """
-        创建包含三种点的单一可视化图：训练集点、聚类原型点、生成的样本点
-        
-        Args:
-            training_embeddings: 训练集embeddings [N, D]
-            prototypes: 聚类原型 [K, D]
-            generated_embeddings: 生成的embeddings [M, D]
-            prototype_labels: 生成的样本对应的原型标签 [M]
-            save_path: 保存路径，如果为None则显示图片
-        """
-        try:
-            from sklearn.manifold import TSNE
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            
-            # 合并所有数据用于TSNE降维
-            all_embeddings = torch.cat([training_embeddings, prototypes, generated_embeddings], dim=0)
-            
-            # 使用TSNE降维到2D
-            tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(all_embeddings)-1))
-            embeddings_2d = tsne.fit_transform(all_embeddings.numpy())
-            
-            # 分离不同数据类型的2D坐标
-            n_training = len(training_embeddings)
-            n_prototypes = len(prototypes)
-            n_generated = len(generated_embeddings)
-            
-            training_2d = embeddings_2d[:n_training]
-            prototypes_2d = embeddings_2d[n_training:n_training+n_prototypes]
-            generated_2d = embeddings_2d[n_training+n_prototypes:]
-            
-            # 创建可视化图形
-            plt.figure(figsize=(14, 10))
-            
-            # 定义颜色主题（在绘制之前先定义）
-            colors = plt.cm.Set3(np.linspace(0, 1, len(prototypes)))
-            
-            # 1. 绘制训练集点（实心点，按标签使用不同颜色）
-            # 计算每个训练样本对应的原型标签
-            training_proto_labels = torch.argmin(torch.cdist(training_embeddings, prototypes), dim=1).numpy()
-            
-            for i in range(len(prototypes)):
-                mask = training_proto_labels == i
+            prototypes = {}
+            for cls in torch.unique(labels):
+                mask = (labels == cls)
                 if mask.any():
-                    plt.scatter(
-                        training_2d[mask, 0], training_2d[mask, 1],
-                        c=[colors[i]], alpha=0.6, s=25,
-                        label=f'Training (P{i})', edgecolors='none', marker='o'
-                    )
-            
-            # 2. 绘制聚类原型点（大星形，实心，不同颜色）
-            for i, (proto_2d, color) in enumerate(zip(prototypes_2d, colors)):
-                plt.scatter(
-                    proto_2d[0], proto_2d[1],
-                    c=[color], s=200, marker='*',
-                    label=f'Prototype {i}', edgecolors='black', linewidth=1.5
-                )
-            
-            # 3. 绘制生成的样本点（空心点，与对应原型使用相同颜色）
-            for i in range(len(prototypes)):
-                mask = prototype_labels == i
-                if mask.any():
-                    plt.scatter(
-                        generated_2d[mask, 0], generated_2d[mask, 1],
-                        c=[colors[i]], s=60, alpha=0.7,
-                        label=f'Generated (P{i})', edgecolors=colors[i], linewidth=1.5,
-                        facecolors='none', marker='o'
-                    )
-            
-            # 设置图形标题和标签
-            plt.title('LDM Prototype-Guided Generation: Training Data, Prototypes, and Generated Samples', 
-                     fontsize=16, fontweight='bold')
-            plt.xlabel('TSNE 1', fontsize=12)
-            plt.ylabel('TSNE 2', fontsize=12)
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            
-            # 保存或显示图片
-            if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                print(f"可视化图片已保存到: {save_path}")
-            else:
-                plt.show()
-            
-            plt.close()
-            
-        except ImportError as e:
-            print(f"❌ 可视化依赖缺失: {e}")
-            print("请安装: pip install scikit-learn matplotlib seaborn")
-        except Exception as e:
-            print(f"❌ 可视化失败: {e}")
-    
-    def visualize_support_query_generation(self, num_samples_per_prototype=50, save_path=None):
-        """
-        在LDM训练完成后，可视化支持集、剩余测试数据和生成模型扩充的数据
-        
-        Args:
-            num_samples_per_prototype: 每个原型生成的样本数量
-            save_path: 可视化图片保存路径，如果为None则显示图片
-        """
-        print("=== 开始支持集、测试数据和生成数据的可视化 ===")
-        
-        if not hasattr(self, 'ldm'):
-            print("❌ 错误：未找到LDM模型，请先运行 init_ldm_components()")
-            return
-        
-        # 确保LDM处于评估模式
-        self.ldm.eval()
-        
-        # 1. 获取支持集embeddings（所有任务都一样的）
-        support_task = self.dataset.sample_one_task(
-            self.dataset.test_tasks, 
-            np.array(list(range(self.dataset.test_classes_num))),
-            K_shot=self.args.K_shot, 
-            query_size=self.args.query_size,
-            test_start_idx=0  # 从0开始，获取固定的支持集
-        )
-        
-        # 获取prompt embeddings
-        if self.args.use_prompt:
-            self.prompt.eval()
-            prompt_embeds = self.prompt()
-        else:
-            prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.args.device)
-        
-        # 获取支持集embeddings
-        support_embs, _ = self.model.sample_input_GNN([support_task], prompt_embeds, True)
-        support_embeddings = support_embs.detach()
-        
-        # 获取支持集标签
-        support_labels = []
-        for graphs in support_task['support_set']:
-            support_labels.append(np.array([graph.label for graph in graphs[:self.args.K_shot]]))
-        support_labels = torch.LongTensor(np.hstack(support_labels)).to(self.args.device)
-        
-        # 2. 获取剩余测试数据embeddings
-        remaining_test_embeddings = []
-        remaining_test_labels = []
-        
-        # 计算剩余测试数据的起始位置
-        start_idx = self.args.K_shot * self.dataset.test_classes_num
-        
-        # 分批处理剩余测试数据
-        batch_size = getattr(self.args, 'batch_size_for_embedding', 512)
-        for i in range(start_idx, len(self.dataset.test_graphs), batch_size):
-            end_idx = min(i + batch_size, len(self.dataset.test_graphs))
-            batch_graphs = self.dataset.test_graphs[i:end_idx]
-            
-            # 创建临时任务结构
-            temp_task = {'support_set': [], 'query_set': [batch_graphs]}
-            temp_embs, _ = self.model.sample_input_GNN([temp_task], prompt_embeds, False)
-            
-            remaining_test_embeddings.append(temp_embs.detach())
-            
-            # 获取标签
-            batch_labels = [graph.label for graph in batch_graphs]
-            remaining_test_labels.extend(batch_labels)
-        
-        if remaining_test_embeddings:
-            remaining_test_embeddings = torch.cat(remaining_test_embeddings, dim=0)
-            remaining_test_labels = torch.LongTensor(remaining_test_labels).to(self.args.device)
-        else:
-            remaining_test_embeddings = torch.empty(0, support_embeddings.shape[1])
-            remaining_test_labels = torch.empty(0, dtype=torch.long)
-        
-        # 3. 先进行任务级微调，然后再生成样本
-        
-        # 任务前备份LDM权重，避免任务间串扰
-        _ldm_backup = deepcopy(self.ldm.state_dict())
-        
-        # 进行任务级微调
-        if getattr(self.args, 'task_finetune_steps', 0) > 0:
-            # 使用任务索引生成任务ID用于进度条显示
-            task_id = "visualization_task"
-            self._task_level_finetune(support_embeddings, support_labels, task_id=task_id)
-        
-        # 使用微调后的LDM生成样本
-        augmented_embeddings = []
-        augmented_labels = []
-        
-        # 根据条件类型选择生成策略
-        condition_type = getattr(self.args, 'condition_type', 'self_labeling')
-        
-        if condition_type == 'class_proto':
-            # 测试阶段：使用真实标签聚类生成类别原型
-            unique_labels = torch.unique(support_labels)
-            label_prototypes = {}
-            
-            # 为每个类别计算原型
-            for label in unique_labels:
-                label_mask = (support_labels == label)
-                if label_mask.sum() > 0:
-                    label_embs = support_embeddings[label_mask]
-                    prototype = F.normalize(label_embs.mean(dim=0, keepdim=True), dim=1)
-                    label_prototypes[label.item()] = prototype
-            
-            # 为每个支持集样本生成增强样本
-            for i in range(len(support_embeddings)):
-                support_sample_label = support_labels[i:i+1]
-                label_key = support_sample_label.item()
-                
-                if label_key in label_prototypes:
-                    # 使用类别原型作为条件
-                    prototype_condition = label_prototypes[label_key]
-                    repeated_condition = prototype_condition.repeat(num_samples_per_prototype, 1)
-                    
-                    # 使用微调后的LDM生成新的embeddings
-                    with torch.no_grad():
-                        generated_embeddings = self.ldm.sample(
-                            shape=(num_samples_per_prototype, support_embeddings.shape[1]),
-                            cond=repeated_condition,
-                            control=repeated_condition
-                        )
-                        
-                    augmented_embeddings.append(generated_embeddings)
-                    augmented_labels.extend([label_key] * num_samples_per_prototype)
-                else:
-                    print(f"警告：标签 {label_key} 没有对应的原型")
-        else:
-            # 其他条件类型：使用样本自己作为条件
-            for i in range(len(support_embeddings)):
-                support_sample = support_embeddings[i:i+1]
-                support_sample_label = support_labels[i:i+1]
-                
-                # 归一化条件
-                condition = F.normalize(support_sample, dim=1)
-                condition = condition.repeat(num_samples_per_prototype, 1)
-                
-                # 使用微调后的LDM生成新的embeddings
+                    z = embeddings[mask]
+                    proto = F.normalize(F.normalize(z, dim=1).mean(dim=0, keepdim=True), dim=1)
+                    prototypes[int(cls.item())] = proto
+            for cls_id, proto in prototypes.items():
+                cond = proto.repeat(num_to_generate, 1)
                 with torch.no_grad():
-                    generated_embeddings = self.ldm.sample(
-                        shape=(num_samples_per_prototype, support_embeddings.shape[1]),
-                        cond=condition,
-                        control=condition
-                    )
-                    
-                augmented_embeddings.append(generated_embeddings)
-                augmented_labels.extend([support_sample_label.item()] * num_samples_per_prototype)
-        
-        # 恢复LDM权重，避免影响后续操作
-        self.ldm.load_state_dict(_ldm_backup)
-        print("已恢复LDM原始权重")
-        
-        if augmented_embeddings:
-            all_augmented_embs = torch.cat(augmented_embeddings, dim=0)
-            all_augmented_labels = torch.LongTensor(augmented_labels).to(self.args.device)
+                    z_gen = ldm_model.sample(shape=(num_to_generate, embedding_dim), cond=cond, control=cond)
+                gen_batches.append(z_gen)
+                gen_labels.extend([cls_id] * num_to_generate)
         else:
-            all_augmented_embs = torch.empty(0, support_embeddings.shape[1])
-            all_augmented_labels = torch.empty(0, dtype=torch.long)
-        
-        # 4. 创建可视化
-        self._visualize_support_query_generation(
-            support_embeddings=support_embeddings.cpu(),
-            support_labels=support_labels.cpu(),
-            remaining_test_embeddings=remaining_test_embeddings.cpu(),
-            remaining_test_labels=remaining_test_labels.cpu(),
-            generated_embeddings=all_augmented_embs.cpu(),
-            generated_labels=all_augmented_labels.cpu(),
-            save_path=save_path
-        )
-        
-        return support_embeddings, remaining_test_embeddings, all_augmented_embs
+            for i in range(len(embeddings)):
+                cond = F.normalize(embeddings[i:i+1], dim=1).repeat(num_to_generate, 1)
+                with torch.no_grad():
+                    z_gen = ldm_model.sample(shape=(num_to_generate, embedding_dim), cond=cond, control=cond)
+                gen_batches.append(z_gen)
+                gen_labels.extend([int(labels[i].item())] * num_to_generate)
+
+        if not gen_batches:
+            return embeddings, labels
+
+        gen_all = torch.cat(gen_batches, dim=0)
+        gen_y = torch.tensor(gen_labels, device=device, dtype=torch.long)
+        return torch.cat([embeddings, gen_all], dim=0), torch.cat([labels, gen_y], dim=0)
     
-    def _visualize_support_query_generation(self, support_embeddings, support_labels, 
-                                          remaining_test_embeddings, remaining_test_labels,
-                                          generated_embeddings, generated_labels, save_path=None):
+
+    def refine_embeddings_with_ldm(
+        self,
+        embeddings: torch.Tensor,            # [S, D] 支持集/任意待修饰嵌入
+        labels: torch.Tensor,                # [S]    对应标签（>=0）
+        ldm_model,                           # LDM模型实例
+        alpha: float = 0.7,                 # 修饰强度(保留度)：alpha=0.7 => 70%原始 + 30%生成
+        use_slerp: bool = False,             # True: 球面插值；False: 线性插值
+        batch_size: int = 64                # 采样mini-batch大小
+    ) -> torch.Tensor:
         """
-        创建包含四种数据的可视化图：支持集、剩余测试数据、生成数据
+        仅做"支持集去噪/修饰"，不做可视化、不改动任务结构。
+        条件使用【类原型的球面均值】（先归一化再均值再归一化），与对比学习的余弦几何一致。
+        返回 refined_embeddings（不做归一化，由调用方根据需要决定）。
         
         Args:
-            support_embeddings: 支持集embeddings [S, D]
-            support_labels: 支持集标签 [S]
-            remaining_test_embeddings: 剩余测试数据embeddings [R, D]
-            remaining_test_labels: 剩余测试数据标签 [R]
-            generated_embeddings: 生成的embeddings [G, D]
-            generated_labels: 生成的样本标签 [G]
-            save_path: 保存路径，如果为None则显示图片
+            embeddings: 输入嵌入 [S, D]
+            labels: 对应标签 [S]
+            ldm_model: LDM模型实例
+            alpha: 修饰强度，默认0.7
+            use_slerp: 是否使用球面插值，默认False
+            batch_size: 批处理大小，默认64
         """
-        try:
-            from sklearn.manifold import TSNE
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            
-            # 合并所有数据用于TSNE降维
-            all_embeddings = torch.cat([support_embeddings, remaining_test_embeddings, generated_embeddings], dim=0)
-            
-            # 使用TSNE降维到2D
-            tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(all_embeddings)-1))
-            embeddings_2d = tsne.fit_transform(all_embeddings.numpy())
-            
-            # 分离不同数据类型的2D坐标
-            n_support = len(support_embeddings)
-            n_remaining = len(remaining_test_embeddings)
-            n_generated = len(generated_embeddings)
-            
-            support_2d = embeddings_2d[:n_support]
-            remaining_2d = embeddings_2d[n_support:n_support+n_remaining]
-            generated_2d = embeddings_2d[n_support+n_remaining:]
-            
-            # 创建可视化图形
-            plt.figure(figsize=(16, 12))
-            
-            # 定义颜色主题
-            unique_labels = torch.unique(torch.cat([support_labels, remaining_test_labels, generated_labels]))
-            colors = plt.cm.Set3(np.linspace(0, 1, len(unique_labels)))
-            color_map = {label.item(): colors[i] for i, label in enumerate(unique_labels)}
-            
-            # 1. 绘制支持集点（实心圆点，较大，按标签使用不同颜色）
-            for i, (emb_2d, label) in enumerate(zip(support_2d, support_labels)):
-                color = color_map[label.item()]
-                plt.scatter(
-                    emb_2d[0], emb_2d[1],
-                    c=[color], alpha=0.8, s=100,
-                    label=f'Support (L{label.item()})' if i == 0 or label != support_labels[i-1] else "",
-                    edgecolors='black', linewidth=1, marker='o'
-                )
-            
-            # 2. 绘制剩余测试数据点（实心方块，中等大小，按标签使用不同颜色）
-            for i, (emb_2d, label) in enumerate(zip(remaining_2d, remaining_test_labels)):
-                color = color_map[label.item()]
-                plt.scatter(
-                    emb_2d[0], emb_2d[1],
-                    c=[color], alpha=0.6, s=60,
-                    label=f'Test (L{label.item()})' if i == 0 or label != remaining_test_labels[i-1] else "",
-                    edgecolors='none', marker='s'
-                )
-            
-            # 3. 绘制生成数据点（空心圆点，较小，按标签使用不同颜色）
-            for i, (emb_2d, label) in enumerate(zip(generated_2d, generated_labels)):
-                color = color_map[label.item()]
-                plt.scatter(
-                    emb_2d[0], emb_2d[1],
-                    c=[color], s=40, alpha=0.7,
-                    label=f'Generated (L{label.item()})' if i == 0 or label != generated_labels[i-1] else "",
-                    edgecolors=color, linewidth=1.5,
-                    facecolors='none', marker='o'
-                )
-            
-            # 设置图形标题和标签
-            plt.title('LDM Data Visualization: Support Set, Test Data, and Generated Samples', 
-                     fontsize=16, fontweight='bold')
-            plt.xlabel('TSNE 1', fontsize=12)
-            plt.ylabel('TSNE 2', fontsize=12)
-            
-            # 创建图例（去除重复项）
-            handles, labels = plt.gca().get_legend_handles_labels()
-            by_label = dict(zip(labels, handles))
-            plt.legend(by_label.values(), by_label.keys(), 
-                      bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-            
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            
-            # 保存或显示图片
-            if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                print(f"可视化图片已保存到: {save_path}")
+        device = embeddings.device
+        S, D = embeddings.size()
+
+        # 过滤非法标签（如 <0），保持原样
+        valid_mask = labels >= 0
+        refined = embeddings.clone()
+
+        # 计算"原始原型"（球面均值：norm→mean→norm）
+        classes = torch.unique(labels[valid_mask])
+        protos = {}
+        for c in classes:
+            m = (labels == c)
+            if m.any():
+                zc = F.normalize(embeddings[m], dim=1)
+                mu = F.normalize(zc.mean(dim=0, keepdim=True), dim=1)
+                protos[int(c.item())] = mu
+
+        # slerp（可选）
+        def _slerp(z0: torch.Tensor, z1: torch.Tensor, t: float, eps: float = 1e-7):
+            z0 = F.normalize(z0, dim=1); z1 = F.normalize(z1, dim=1)
+            cos = (z0 * z1).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
+            theta = torch.acos(cos)
+            sin = torch.sin(theta).clamp_min(eps)
+            return (torch.sin((1 - t) * theta) / sin) * z0 + (torch.sin(t * theta) / sin) * z1
+
+        # 按类别成组采样并修饰
+        for c, proto in protos.items():
+            idx = torch.nonzero((labels == c), as_tuple=False).squeeze(1)
+            if idx.numel() == 0:
+                continue
+
+            cond_full = proto.repeat(idx.numel(), 1)  # [Nc, D]
+            gens = []
+            for i in range(0, idx.numel(), batch_size):
+                cond_b = cond_full[i:i+batch_size]
+                gen_b = ldm_model.sample(shape=(cond_b.size(0), D), cond=cond_b, control=cond_b)
+                gens.append(gen_b)
+            Gc = torch.cat(gens, dim=0)               # [Nc, D]
+            Zc = embeddings.index_select(0, idx)      # [Nc, D]
+
+            if use_slerp:
+                Rc = _slerp(Zc, Gc, t=1.0 - alpha)    # 更贴近余弦几何
             else:
-                plt.show()
-            
-            plt.close()
-            
-        except ImportError as e:
-            print(f"❌ 可视化依赖缺失: {e}")
-            print("请安装: pip install scikit-learn matplotlib seaborn")
-        except Exception as e:
-            print(f"❌ 可视化失败: {e}")
-            import traceback
-            traceback.print_exc()
-    
+                Rc = alpha * Zc + (1.0 - alpha) * Gc  # 线性插值
 
-    
-   
+            refined.index_copy_(0, idx, Rc)
 
+        # 非法标签样本保持原样（已在 refined.clone()）
+        return refined
+        
+    def visualize_refine_aug(self, save_path=None):
+        """Refine → Augment (from refined) → Visualize on one t-SNE figure."""
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+        import torch
+        import torch.nn.functional as F
+
+        assert self.ldm is not None, "LDM not initialized."
+        self.ldm.eval()
+
+        # 固定抽一个支持集任务
+        task = self.dataset.sample_one_task(
+            self.dataset.test_tasks,
+            np.arange(self.dataset.test_classes_num),
+            K_shot=self.args.K_shot,
+            query_size=self.args.query_size,
+            test_start_idx=0
+        )
+
+        # 取支持集嵌入与标签（评估期不使用prompt，置零）
+        prompt = torch.zeros(self.args.num_token, self.args.node_fea_size, device=self.args.device)
+        z_sup, _ = self.model.sample_input_GNN([task], prompt, True)
+        z_sup = z_sup.detach()
+        y_sup = torch.LongTensor(np.hstack([[g.label for g in gs] for gs in task['support_set']])).to(self.args.device)
+
+        # refine 支持集（一次）
+        z_ref = self.refine_embeddings_with_ldm(
+            embeddings=z_sup,
+            labels=y_sup,
+            ldm_model=self.ldm,
+            alpha=float(self.args.refine_alpha),
+            use_slerp=bool(self.args.refine_use_slerp),
+            batch_size=int(self.args.ldm_batch_size)
+        )
+
+        # 检查：若 refine 前后有样本嵌入未变化，打印告警
+        with torch.no_grad():
+            same_mask = torch.isclose(z_ref, z_sup, rtol=1e-5, atol=1e-8).all(dim=1)
+            num_same = int(same_mask.sum().item())
+            if num_same > 0:
+                idx_same = torch.nonzero(same_mask, as_tuple=False).squeeze(1).cpu().tolist()
+                print(f"[Warning] Refine后仍未变化的支持集样本数: {num_same} / {z_sup.size(0)}，示例索引: {idx_same[:10]}")
+
+        # 基于 refined 扩充若干（仅可视化）
+        num_aug = int(self.args.num_augmented_samples)
+        if num_aug > 0:
+            z_enh, y_enh = self.generate_augmented_embeddings(
+                embeddings=z_ref.detach(),
+                labels=y_sup,
+                num_to_generate=num_aug,
+                ldm_model=self.ldm,
+                device=self.args.device,
+                condition_type=self.args.condition_type
+            )
+            z_aug = z_enh[len(z_ref):]
+            y_aug = y_enh[len(y_sup):]
+        else:
+            z_aug = torch.empty(0, z_ref.shape[1], device=self.args.device)
+            y_aug = torch.empty(0, dtype=torch.long, device=self.args.device)
+
+        # 原型（norm→mean→norm）
+        def _protos(embs: torch.Tensor, labels: torch.Tensor):
+            ps, ids = [], []
+            for c in torch.unique(labels):
+                m = (labels == c)
+                if m.any():
+                    p = F.normalize(F.normalize(embs[m], dim=1).mean(0, keepdim=True), dim=1)
+                    ps.append(p); ids.append(int(c.item()))
+            return (torch.cat(ps, 0) if len(ps) else torch.empty(0, embs.size(1), device=embs.device)), ids
+
+        p_orig, ids = _protos(z_sup, y_sup)
+        p_ref, _    = _protos(z_ref, y_sup)
+
+        # 仅可视化数据（归一化+CPU）
+        z_sup_v = F.normalize(z_sup, dim=1).cpu()
+        z_ref_v = F.normalize(z_ref, dim=1).cpu()
+        z_aug_v = (F.normalize(z_aug, dim=1).cpu()
+                if z_aug.numel() > 0 else torch.empty(0, z_ref.shape[1]))
+        y_aug_v = (y_aug.cpu().numpy() if y_aug.numel() > 0 else np.zeros(0, dtype=int))
+        protos_v = (torch.cat([p_orig, p_ref], 0).cpu() if p_orig.numel() > 0 else torch.empty(0, z_ref.shape[1]))
+        proto_tags = [f"orig_{i}" for i in ids] + [f"refined_{i}" for i in ids]
+
+        # t-SNE
+        parts, sizes = [z_sup_v, z_ref_v], [len(z_sup_v), len(z_ref_v)]
+        if len(z_aug_v) > 0: parts.append(z_aug_v); sizes.append(len(z_aug_v))
+        if len(protos_v) > 0: parts.append(protos_v); sizes.append(len(protos_v))
+        X = torch.cat(parts, 0)
+        n = len(X)
+        perp = max(2, min(30, max(5, n // 3)))
+        X2 = TSNE(n_components=2, random_state=42, perplexity=min(perp, n - 1)).fit_transform(X.numpy())
+
+        s0 = sizes[0]; s1 = s0 + sizes[1]; idx = s1
+        sup2 = X2[:s0]; ref2 = X2[s0:s1]
+        if len(z_aug_v) > 0:
+            s2 = idx + sizes[2]; aug2 = X2[idx:s2]; idx = s2
+        else:
+            aug2 = np.zeros((0, 2))
+        if len(protos_v) > 0:
+            pr2 = X2[idx:idx + sizes[-1]]
+            orig_pr2, ref_pr2 = pr2[:len(ids)], pr2[len(ids):]
+        else:
+            orig_pr2 = ref_pr2 = np.zeros((0, 2))
+
+        # 颜色（使用对比更强的tab20）
+        uniq = torch.unique(y_sup.cpu()).tolist()
+        _palette = plt.cm.tab20(np.linspace(0, 1, 20))
+        cmap = {int(lbl): _palette[i % len(_palette)] for i, lbl in enumerate(uniq)}
+
+        # 画图
+        plt.figure(figsize=(16, 12))
+        y_np = y_sup.cpu().numpy()
+        for c in uniq:
+            m = (y_np == c)
+            if m.any():
+                plt.scatter(sup2[m,0], sup2[m,1], c=[cmap[c]], s=60, alpha=0.9, edgecolors='black', linewidth=0.8, label=f'Orig C{c}')
+                plt.scatter(ref2[m,0], ref2[m,1], c=[cmap[c]], s=80, alpha=0.7, facecolors='none', edgecolors=cmap[c], linewidth=1.6, label=f'Refined C{c}')
+
+        if len(aug2) > 0:
+            for c in uniq:
+                m_aug = (y_aug_v == c)
+                if m_aug.any():
+                    plt.scatter(aug2[m_aug,0], aug2[m_aug,1], c=[cmap[c]], s=50, alpha=0.6, facecolors='none', edgecolors=cmap[c], linewidth=1.2, marker='^', label=f'Aug C{c}')
+
+        for i in range(len(sup2)):
+            plt.plot([sup2[i,0], ref2[i,0]], [sup2[i,1], ref2[i,1]], 'k-', alpha=0.25, linewidth=0.5)
+
+        for i in range(len(orig_pr2)):
+            c = uniq[i] if i < len(uniq) else uniq[-1]
+            plt.scatter(orig_pr2[i,0], orig_pr2[i,1], c=[cmap[c]], s=240, marker='*', edgecolors='black', linewidth=1.8, label=f'Proto-Orig {c}')
+        for i in range(len(ref_pr2)):
+            c = uniq[i] if i < len(uniq) else uniq[-1]
+            plt.scatter(ref_pr2[i,0], ref_pr2[i,1], c=[cmap[c]], s=280, marker='*', facecolors='none', edgecolors=cmap[c], linewidth=2.2, label=f'Proto-Ref {c}')
+
+        plt.title('Refine → Augment (Support)', fontsize=16)
+        plt.xlabel('t-SNE 1'); plt.ylabel('t-SNE 2')
+        handles, labels = plt.gca().get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        plt.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+        plt.grid(True, alpha=0.3); plt.tight_layout()
+        if save_path: plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        else: plt.show()
+        plt.close()
+
+        # ===== 新增：并排绘制两张图（原始支持集+查询集；refine后支持集+查询集）并保存为一个PNG =====
+        # 计算同一任务的查询集嵌入与标签
+        prompt_q = torch.zeros(self.args.num_token, self.args.node_fea_size, device=self.args.device)
+        q_embs, _ = self.model.sample_input_GNN([task], prompt_q, False)
+        q_embs = q_embs.detach()
+        q_labels = torch.LongTensor(np.hstack([[g.label for g in gs] for gs in task['query_set']])).to(self.args.device)
+
+        # 若需要，对查询集也做与支持集一致的refine以便对比（右图使用refine后的支持集，但查询集保持原始以体现对比）
+        # 这里按需求：右图仅替换支持集为z_ref，查询集保持原始q_embs
+
+        # 归一化
+        z_sup_norm = F.normalize(z_sup, dim=1).cpu()
+        z_ref_norm = F.normalize(z_ref, dim=1).cpu()
+        z_q_norm = F.normalize(q_embs, dim=1).cpu()
+
+        # 统一做一次TSNE，保证两张子图坐标一致性（原/精修 支持 + 原始查询）
+        parts_sq = [z_sup_norm, z_ref_norm, z_q_norm]
+        sizes_sq = [len(z_sup_norm), len(z_ref_norm), len(z_q_norm)]
+        X_sq = torch.cat(parts_sq, 0)
+        n_sq = len(X_sq)
+        perp_sq = max(2, min(30, max(5, n_sq // 3)))
+        X2_sq = TSNE(n_components=2, random_state=42, perplexity=min(perp_sq, n_sq - 1)).fit_transform(X_sq.numpy())
+
+        s_sup = sizes_sq[0]
+        s_ref = sizes_sq[1]
+        s_q   = sizes_sq[2]
+        sup2_sq = X2_sq[:s_sup]
+        ref2_sq = X2_sq[s_sup:s_sup+s_ref]
+        qry2_sq = X2_sq[s_sup+s_ref:s_sup+s_ref+s_q]
+
+        # 颜色映射（基于支持+查询的标签全集，使用tab20提高对比度）
+        uniq_all = torch.unique(torch.cat([y_sup.cpu(), q_labels.cpu()])).tolist()
+        _palette_all = plt.cm.tab20(np.linspace(0, 1, 20))
+        cmap_all = {int(lbl): _palette_all[i % len(_palette_all)] for i, lbl in enumerate(uniq_all)}
+
+        y_sup_np = y_sup.cpu().numpy()
+        y_q_np = q_labels.cpu().numpy()
+
+        # 创建并排子图
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+        # 左图：原始支持集 + 全部查询集
+        ax = axes[0]
+        for c in uniq_all:
+            m_sup = (y_sup_np == c)
+            if m_sup.any():
+                ax.scatter(sup2_sq[m_sup,0], sup2_sq[m_sup,1], c=[cmap_all[c]], s=60, alpha=0.9,
+                           edgecolors='black', linewidth=0.8, label=f'Support C{c}')
+            m_q = (y_q_np == c)
+            if m_q.any():
+                ax.scatter(qry2_sq[m_q,0], qry2_sq[m_q,1], c=[cmap_all[c]], s=50, alpha=0.6,
+                           edgecolors='none', marker='s', label=f'Query C{c}')
+        ax.set_title('Original Support + All Query')
+        ax.set_xlabel('t-SNE 1'); ax.set_ylabel('t-SNE 2')
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # 右图：Refined 支持集 + 原始查询集
+        ax = axes[1]
+        for c in uniq_all:
+            m_sup = (y_sup_np == c)
+            if m_sup.any():
+                ax.scatter(ref2_sq[m_sup,0], ref2_sq[m_sup,1], c=[cmap_all[c]], s=80, alpha=0.7,
+                           facecolors='none', edgecolors=cmap_all[c], linewidth=1.6, label=f'Refined C{c}')
+            m_q = (y_q_np == c)
+            if m_q.any():
+                ax.scatter(qry2_sq[m_q,0], qry2_sq[m_q,1], c=[cmap_all[c]], s=50, alpha=0.6,
+                           edgecolors='none', marker='s', label=f'Query C{c}')
+        ax.set_title('Refined Support + Original Query')
+        ax.set_xlabel('t-SNE 1'); ax.set_ylabel('t-SNE 2')
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_path:
+            out_path = save_path[:-4] + '_sup_query.png' if save_path.lower().endswith('.png') else save_path + '_sup_query.png'
+            plt.savefig(out_path, dpi=300, bbox_inches='tight')
+        else:
+            plt.show()
+        plt.close()
+
+            
 
 
 

@@ -1,141 +1,238 @@
 import os
 import json
-
-import torch
 import random
 import numpy as np
+import torch
+
 
 from omegaconf import OmegaConf
 
-from train import Trainer
+import subprocess   
 from unified_trainer import UnifiedTrainer
 
-# 添加 wandb 导入
+
 import wandb
 
 def build_cfg():
-    # 仅用 OmegaConf，从命令行读取：必须提供 config=path/to.yaml，其余键值用于覆盖
+    """构建配置：优先级 CLI > 配置文件 > 代码默认值。
+    - 从 CLI 读取（OmegaConf.from_cli），支持传入 config=path.yaml
+    - 若未提供 config，使用默认路径 'configs/TRIANGLES_ldm.yaml'
+    - 以代码内默认值为最低优先级
+    """
+    # 代码默认值（最低优先级）
+    default_config = {
+        'dataset_name': 'TRIANGLES',
+        'baseline_mode': None,
+        'N_way': 3,
+        'K_shot': 5,
+        'query_size': 10,
+        'patience': 5,
+        'dropout': 0.5,
+        'batch': 128,  # 未使用，占位
+        'gin_layer': 3,
+        'gin_hid': 128,
+        'aug1': 'node_drop',
+        'aug2': 'feature_mask',
+        't': 0.2,
+        'lr': 0.001,
+        'weight_decay': 1e-7,
+        'eval_interval': 100,
+        'epoch_num': 3000,
+        'use_select_sim': False,
+        'gen_train_num': 500,
+        'gen_test_num': 20,
+        'save_test_emb': True,
+        'test_mixup': False,
+        'num_token': 1,
+        'use_prompt': False,
+        'device': 'cuda',
+        'graph_pooling_type': 'sum',
+        # LDM 相关默认
+        'use_pretrained_encoder': False,
+        'use_pretrained_ldm': True,
+        'num_augmented_samples': 0,
+        'refine_support_before_training': False,
+        'learning_rate_ldm': 1e-4,
+        'weight_decay_ldm': 1e-4,
+        'time_steps': 50,
+        'beta_start': 1e-4,
+        'beta_end': 2e-2,
+        'ldm_batch_size': 512,
+        'ldm_ema_decay': 0.9,
+        'ldm_es_interval': 100,
+        'condition_type': 'class_proto',
+        'batch_size_for_embedding': 512,
+        # wandb 默认
+        'use_wandb': False,
+        'wandb_online': True,
+    }
+    defaults = OmegaConf.create(default_config)
+
+    # CLI（最高优先级），支持 config=xxx 覆盖路径
     cli = OmegaConf.from_cli()
-    if 'config' not in cli:
-        raise ValueError("Missing required CLI arg: config=path/to.yaml")
-    base = OmegaConf.load(cli.config)
-    cli.pop('config')
-    cfg = OmegaConf.merge(base, cli)  # CLI 覆盖 YAML
+    config_path = cli.get('config', 'configs/TRIANGLES_ldm.yaml')
+
+    # 配置文件（中间优先级）
+    base = OmegaConf.load(config_path) if os.path.exists(config_path) else OmegaConf.create({})
+
+    # 合并：默认 < 文件 < CLI
+    cfg = OmegaConf.merge(defaults, base, cli)
+
+    # 清理：不把 config 路径残留在最终配置里
+    if 'config' in cfg:
+        cfg.pop('config')
+
+
+    cfg.device = select_device(cfg.device)
     return cfg
     
-def pick_best_device() -> str:
-    # 返回 'cuda:x' 或 'cpu'
-    if not torch.cuda.is_available():
+def select_device(device_pref):
+    # 规范化输入
+    s = str(device_pref).lower().strip()
+
+    # 优先选择 CPU
+    if s == 'cpu':
         return 'cpu'
-    try:
-        best_i, best_free = 0, -1
-        for i in range(torch.cuda.device_count()):
-            free, _ = torch.cuda.mem_get_info(i)
-            if free > best_free:
-                best_i, best_free = i, free
-        return f'cuda:{best_i}'
-    except Exception:
+
+    # CUDA 设备选择（显式索引）
+    if s.startswith('cuda:'):
+        if torch.cuda.is_available():
+            return s
+        return 'cpu'
+
+    if s in ('cuda', 'gpu', 'auto'):
+        if torch.cuda.is_available():
+            try:
+                out = subprocess.check_output([
+                    'nvidia-smi',
+                    '--query-gpu=memory.used,utilization.gpu',
+                    '--format=csv,noheader,nounits'
+                ], stderr=subprocess.DEVNULL, timeout=1.5)
+
+                lines = out.decode().strip().splitlines()
+                stats = []
+                for i, line in enumerate(lines):
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) != 2:
+                        continue
+                    mem, util = int(parts[0]), int(parts[1])
+                    stats.append((i, mem, util))
+
+                if not stats:
+                    return 'cuda:0'
+
+                # 按显存使用和 GPU 利用率排序，选择最优的 GPU
+                stats.sort(key=lambda x: (x[1], x[2]))
+                best_idx = stats[0][0]
+                return f'cuda:{best_idx}'
+            except Exception:
+                # nvidia-smi 不可用或失败，退回第一个可用 CUDA
+                return 'cuda:0'
+        # CUDA 不可用
+        return 'cpu'
+
+    # 兜底（GPU > CPU）
+    if torch.cuda.is_available():
         return 'cuda:0'
+    return 'cpu'
 
 def main():
     cfg = build_cfg()
-
+    
     # 初始化 wandb（如果配置中启用）
-    if getattr(cfg, 'use_wandb', False):
+    if cfg.use_wandb:
         wandb.init(
-            project=getattr(cfg, 'wandb_project', 'fsl_ddpm'),
-            entity=getattr(cfg, 'wandb_entity', None),
-            name=getattr(cfg, 'wandb_run_name', None),
+            project=cfg.wandb_project if 'wandb_project' in cfg else 'fsl_ddpm',
+            entity=cfg.wandb_entity if 'wandb_entity' in cfg else None,
+            name=cfg.wandb_run_name if 'wandb_run_name' in cfg else None,
             config=OmegaConf.to_container(cfg, resolve=True),
-            tags=getattr(cfg, 'wandb_tags', []),
-            notes=getattr(cfg, 'wandb_notes', ''),
-            mode='online' if getattr(cfg, 'wandb_online', True) else 'disabled'
+            tags=cfg.wandb_tags if 'wandb_tags' in cfg else [],
+            notes=cfg.wandb_notes if 'wandb_notes' in cfg else '',
+            mode='online' if cfg.wandb_online else 'disabled'
         )
         print(f"✅ wandb 初始化成功: {wandb.run.name}")
     else:
         print("ℹ️ wandb 未启用")
 
-    # 设置随机性（原逻辑保持）
-    os.environ['PYTHONHASHSEED'] = str(72)
-    random.seed(72); np.random.seed(72)
-    torch.manual_seed(72); torch.cuda.manual_seed(72)
+    # 设置随机性
+
+    os.environ['PYTHONHASHSEED'] = str(cfg.seed)
+    random.seed(cfg.seed); np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed); torch.cuda.manual_seed(cfg.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-    # 若配置里写的是 'cuda'，自动挑选空闲显存最大的 GPU
-    if str(getattr(cfg, 'device', '')).lower() == 'cuda':
-        cfg.device = pick_best_device()
 
+    #保存点配置
     results_dir = './our_results'
     save_dir = './savepoint'
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
 
     dataset = cfg.dataset_name
-    k = cfg.K_shot
-    text_file_name = os.path.join(results_dir, f"{dataset}-{k}-shot.txt")
-    params_txt = os.path.join(results_dir, f"{dataset}-{k}-shot-params.txt")
-    params_yaml = os.path.join(results_dir, f"{dataset}-{k}-shot-params.yaml")
 
-    # 最终配置
-    OmegaConf.save(config=cfg, f=params_yaml)
+    text_file_name = os.path.join(results_dir, f"{dataset}-{ cfg.K_shot}-shot.txt")
 
-    # 检查是否启用LDM增强模式
-    use_ldm_augmentation = getattr(cfg, 'use_ldm_augmentation', False)
-    
+
+
     with open(text_file_name, 'w') as logf:
-        if use_ldm_augmentation:
-            # 使用统一训练器进行LDM增强流程
-            print("=== 启用LDM增强训练模式 ===")
-            unified_trainer = UnifiedTrainer(cfg, logf=logf)
-            
-            # 阶段1：训练encoder 或 直接加载预训练权重
-            if getattr(cfg, 'use_pretrained_encoder', False):
-                print("=== 跳过Encoder训练，加载已保存的权重 ===")
-                unified_trainer.load_pretrained_encoder(getattr(cfg, 'encoder_ckpt_path', None))
-            else:
-                unified_trainer.train_encoder()
-            
-            # 阶段2：初始化LDM并收集embeddings
-            unified_trainer.init_ldm_components()
-            unified_trainer.collect_training_embeddings()
-            
-            # 阶段3：训练LDM（或从ckpt加载跳过训练）
-            if getattr(cfg, 'use_pretrained_ldm', False):
-                print("=== 跳过LDM训练，加载已保存的LDM权重 ===")
-                unified_trainer.load_pretrained_ldm(getattr(cfg, 'ldm_ckpt_path', None))
-            else:
-                unified_trainer.train_ldm()
-            
-            # # 阶段3.5：LDM训练完成后的数据可视化
-            # print("=== 开始LDM训练完成后的数据可视化 ===")
-            # # 调用可视化函数，生成支持集、测试数据和生成数据的可视化
-            # save_path = os.path.join(results_dir, f"{dataset}-{k}-shot-ldm-visualization.png")
-            # support_embs, test_embs, generated_embs = unified_trainer.visualize_support_query_generation(
-            #     num_samples_per_prototype=getattr(cfg, 'num_augmented_samples', 30),
-            #     save_path=save_path
-            # )
-            # print(f"✅ 数据可视化完成，图片保存到: {save_path}")
-            
-            # 阶段4：测试
-            original_acc, original_std = unified_trainer.test_model(use_ldm_augmentation=False, test_name="原始Encoder测试（无LDM增强）")
-            ldm_acc, ldm_std = unified_trainer.test_model(use_ldm_augmentation=True, test_name="最终测试（使用LDM增强）")
-            
-            logf.write(f"=== 最终结果比较 ===\n")
-            logf.write(f"原始Encoder: {original_acc:.4f} ± {original_std:.4f}\n")
-            logf.write(f"LDM增强: {ldm_acc:.4f} ± {ldm_std:.4f}\n")
-            logf.write(f"提升: {ldm_acc - original_acc:.4f}\n")
-            
-            test_acc = ldm_acc  # 返回LDM增强的结果
+        # 写入最终配置（YAML）
+        logf.write("=== Config (CLI > File > Defaults) ===\n")
+        logf.write(OmegaConf.to_yaml(cfg))
+        logf.write("\n")
+        print(cfg)
+        # 使用统一训练器进行LDM增强流程
+        print("=== 启用LDM增强训练模式 ===")
+        unified_trainer = UnifiedTrainer(cfg, logf=logf)
+        
+        # 阶段1：训练encoder 或 直接加载预训练权重
+        if cfg.use_pretrained_encoder:
+            print("=== 跳过Encoder训练，加载已保存的权重 ===")
+            unified_trainer.load_pretrained_encoder(cfg.encoder_ckpt_path if 'encoder_ckpt_path' in cfg else None)
         else:
-            # 使用原始训练器
-            print("=== 使用原始训练模式 ===")
-            trainer = Trainer(cfg, logf=logf)
-            trainer.train()
-            test_acc = trainer.test()
+            unified_trainer.train_encoder()
+        
+        # 阶段2：初始化LDM并收集embeddings
+        unified_trainer.init_ldm_components()
+        unified_trainer.collect_training_embeddings()
+        
+        # 阶段3：训练LDM（或从ckpt加载跳过训练）
+        if cfg.use_pretrained_ldm:
+            print("=== 跳过LDM训练，加载已保存的LDM权重 ===")
+            unified_trainer.load_pretrained_ldm(cfg.ldm_ckpt_path if 'ldm_ckpt_path' in cfg else None)
+        else:
+            unified_trainer.train_ldm()
+        
 
-    with open(params_txt, 'a') as f:
-        json.dump({str(test_acc): str(cfg)}, f, indent=4)
+        # ==================== 测试评估阶段 ====================
+        print("=== 开始测试评估 ===")
+        
+        # 加载LDM模型（如果需要的话）
+        ldm_model = None
+        if cfg.num_augmented_samples > 0 or cfg.refine_support_before_training:
+            print("=== 加载LDM模型 ===")
+            ldm_model_path = os.path.join(save_dir, f'{cfg.dataset_name}_ldm.pkl')
+            if os.path.exists(ldm_model_path):
+                unified_trainer.ldm.load_state_dict(torch.load(ldm_model_path, map_location=cfg.device, weights_only=True))
+                print(f"LDM模型加载成功: {os.path.basename(ldm_model_path)}")
+                unified_trainer.ldm.eval()
+                ldm_model = unified_trainer.ldm
+
+        print("=== 测试 ===")
+        test_acc, test_std = unified_trainer.test_model(
+            num_augmented_samples=cfg.num_augmented_samples,
+            refine_support_before_training=cfg.refine_support_before_training,
+            ldm_model=ldm_model,
+            test_name="测试"
+        )
+        
+        # 记录测试结果
+        logf.write(f"=== 测试结果 ===\n")
+        logf.write(f"测试准确率: {test_acc:.4f} ± {test_std:.4f}\n")
+        
+        # ==================== 结果记录 ====================
+        logf.write(f"=== 最终结果比较 ===\n")
+        logf.write(f"最终测试准确率: {test_acc:.4f}\n")
 
     # 完成 wandb 运行
     if wandb.run is not None:

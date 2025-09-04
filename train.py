@@ -32,7 +32,7 @@ class Trainer:
         self.log = LogReg(self.model.sample_input_emb_size, self.args.N_way).to(args.device)
         
         # 根据use_prompt决定优化器参数
-        if getattr(args, 'use_prompt', True):
+        if args.use_prompt:
             self.opt = optim.SGD([{'params': self.log.parameters()}, {'params': self.prompt.parameters()}], lr=0.01)
         else:
             self.opt = optim.SGD([{'params': self.log.parameters()}], lr=0.01)

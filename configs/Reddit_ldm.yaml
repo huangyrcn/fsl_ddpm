@@ -1,10 +1,10 @@
-# 基础配置（来自原ENZYMES.yaml）
-dataset_name: ENZYMES
+# 基础配置（来自原Reddit.yaml）
+dataset_name: Reddit
 baseline_mode: null
-N_way: 2
+N_way: 4
 K_shot: 5
 query_size: 10
-patience: 5
+patience: 50
 dropout: 0.5
 batch: 128
 gin_layer: 3
@@ -22,19 +22,19 @@ gen_test_num: 0
 save_test_emb: true
 
 num_token: 1
-use_prompt: true
+use_prompt: false
 device: cuda
-train_classes_num: 4
-test_classes_num: 2
-node_fea_size: 9
+train_classes_num: 7
+test_classes_num: 4
+node_fea_size: 524
 sample_input_size: 256
 
 use_pretrained_encoder: false
-encoder_ckpt_path: ./savepoint/ENZYMES_encoder.pkl
+encoder_ckpt_path: ./savepoint/Reddit_encoder.pkl
 # LDM增强配置
 use_ldm_augmentation: true
 use_pretrained_ldm: false  # 是否跳过LDM训练并从ckpt加载
-ldm_ckpt_path: ./savepoint/ENZYMES_ldm.pkl  # 预训练LDM权重（state_dict）
+ldm_ckpt_path: ./savepoint/Reddit_ldm.pkl  # 预训练LDM权重（state_dict）
 
 # LDM相关参数  
 learning_rate_ldm: 0.001
@@ -43,17 +43,20 @@ num_epochs_ldm: 200
 patience_ldm: 10
 time_steps: 100
 beta_start: 0.0001
-beta_end: 0.02
+beta_end: 0.02 
 ldm_batch_size: 64
 ldm_ema_decay: 0.9              # LDM训练EMA衰减
 ldm_es_interval: 100             # LDM早停检查间隔（与打印间隔一致）
 
 # 条件类型配置
 # condition_type: self_labeling  # 所有阶段都使用样本自己作为条件
-condition_type: class_proto  # 训练时使用K-means，其他阶段使用真实标签聚类
+condition_type: self_labeling 
 
 # 数据增强参数
-num_augmented_samples: 3
+# 每个支持集样本生成的增强样本数量
+# 策略：使用支持集样本作为条件，每个样本生成num_augmented_samples个增强样本
+num_augmented_samples: 5
+
 batch_size_for_embedding: 128
 
 # 任务级微调参数
@@ -71,6 +74,7 @@ refine_alpha: 0.7  # 修饰强度，0.7表示70%原始 + 30%生成
 # wandb 配置
 use_wandb: true
 wandb_project: "my_fsl_project"
-wandb_run_name: "ENZYMES_experiment"
+wandb_run_name: "Reddit_experiment"
 wandb_entity: "huangyrcn"  # 替换为你的团队名称
 wandb_online: true
+

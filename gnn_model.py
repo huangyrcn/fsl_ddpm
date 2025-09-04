@@ -1,9 +1,7 @@
-import math
 import torch
 import torch.nn as nn
 
-from functools import reduce
-from operator import mul
+
 import torch.nn.functional as F
 from torch_scatter import scatter_mean, scatter_max
 
@@ -316,8 +314,7 @@ class Model(nn.Module):
 
         self.sample_input_emb_size = args.sample_input_size
 
-        # 安全地获取 graph_pooling_type，如果不存在则默认为 'sum'
-        graph_pooling_type = getattr(self.args, 'graph_pooling_type', 'sum')
+        graph_pooling_type = self.args.graph_pooling_type
         
         self.gin = GraphCNN(input_dim=args.node_fea_size, use_select_sim=args.use_select_sim, num_layers=args.gin_layer,
                             hidden_dim=args.gin_hid, graph_pooling_type=graph_pooling_type, device=self.device).to(self.device)  # .cuda()
