@@ -63,38 +63,7 @@ class Dataset:
         for graph in self.train_graphs:
             self.train_tasks[graph.label].append(graph)
 
-        # perform mix-up for train graphs
-        generate_train_graphs = []
-        fir, sec = np.random.randint(low=0, high=len(self.train_graphs), size=(2, self.args.gen_train_num))
-        for i in range(self.args.gen_train_num):
-            if i % 64 == 0:
-                lam = np.random.beta(0.5, 0.5)
-            lam = max(lam, 1 - lam)
-            # emb1 = self.train_graphs[fir[i]].node_features / self.train_graphs[fir[i]].norm(dim=1)
-            match = self.train_graphs[fir[i]].node_features @ self.train_graphs[sec[i]].node_features.T
-            normalized_match = F.softmax(match, dim=0)
-
-            mixed_adj = lam * to_dense_adj(self.train_graphs[fir[i]].edge_mat)[0].double() + (
-                        1 - lam) * normalized_match.double() @ to_dense_adj(self.train_graphs[sec[i]].edge_mat)[
-                            0].double() @ normalized_match.double().T
-            mixed_adj[mixed_adj < 0.1] = 0
-            mixed_x = lam * self.train_graphs[fir[i]].node_features + (1 - lam) * normalized_match.float() @ \
-                      self.train_graphs[sec[i]].node_features
-
-            edge_index, _ = dense_to_sparse(mixed_adj)
-            edges = [(x, y) for x, y in zip(edge_index[0].tolist(), edge_index[1].tolist())]
-            g = nx.Graph()
-            g.add_edges_from(edges)
-            g.add_nodes_from(list(range(edge_index.max() + 1)))
-            G = Graph(g, -1)
-            G.edge_mat = edge_index
-            G.node_features = mixed_x
-            generate_train_graphs.append(G)
-        print("generate yes")
-        print("generate len is ", len(generate_train_graphs))
-        print("before the number of train graphs is ", len(self.train_graphs))
-        self.train_graphs.extend(generate_train_graphs)
-        print("after the number of train graphs is ", len(self.train_graphs))
+        # 训练集不再进行数据混合扩增
 
         #         self.valid_tasks = defaultdict(list)
         #         for graph in self.validation_graphs:
@@ -122,40 +91,7 @@ class Dataset:
             # self.test_fine_tune[index].extend(list(self.test_tasks[index])[:self.args.K_shot])
             self.total_test_g_list.extend(list(self.test_tasks[index])[self.args.K_shot:])
 
-        # perform mixup for test graphs
-        self.generate_test_graphs = defaultdict(list)
-        for index in range(self.test_classes_num):
-            fir, sec = np.random.randint(low=0, high=len(self.test_fine_tune_list), size=(2, self.args.gen_test_num))
-            for i in range(self.args.gen_test_num):
-                lam = np.random.beta(0.5, 0.5)
-                lam = max(lam, 1 - lam)
-
-                match = self.test_fine_tune_list[index][fir[i]].node_features @ self.test_fine_tune_list[index][
-                    sec[i]].node_features.T
-                normalized_match = F.softmax(match, dim=0)
-                mixed_adj = lam * to_dense_adj(self.test_fine_tune_list[index][fir[i]].edge_mat)[0].double() + (
-                            1 - lam) * normalized_match.double() @ \
-                            to_dense_adj(self.test_fine_tune_list[index][sec[i]].edge_mat)[
-                                0].double() @ normalized_match.double().T
-                mixed_adj[mixed_adj < 0.1] = 0
-                mixed_x = lam * self.test_fine_tune_list[index][fir[i]].node_features + (
-                            1 - lam) * normalized_match.float() @ self.test_fine_tune_list[index][sec[i]].node_features
-            
-
-                edge_index, _ = dense_to_sparse(mixed_adj)
-                edges = [(x, y) for x, y in zip(edge_index[0].tolist(), edge_index[1].tolist())]
-                g = nx.Graph()
-                g.add_edges_from(edges)
-                g.add_nodes_from(list(range(edge_index.max() + 1)))
-                G = Graph(g, -2)
-                G.edge_mat = edge_index
-                G.node_features = mixed_x
-                G.y_a = self.test_fine_tune_list[index][fir[i]].label
-                G.y_b = self.test_fine_tune_list[index][sec[i]].label
-                G.lam = lam
-                self.generate_test_graphs[index].append(G)
-
-        print("generate yes")
+        # 测试集不再进行数据混合扩增
         np.random.seed(args.seed)
         np.random.shuffle(self.total_test_g_list)
 
@@ -166,11 +102,7 @@ class Dataset:
         query_set = []
         for index in class_index:
             g_list = list(task_source[index])
-            if self.args.gen_test_num > 0:
-                mid = g_list[:K_shot] + list(self.generate_test_graphs[index])
-                support_set.append(mid)
-            else:
-                support_set.append(g_list[:K_shot])
+            support_set.append(g_list[:K_shot])
 
         # during test, sample from all test samples
         append_count = 0
@@ -202,9 +134,7 @@ class Graph(object):
         self.neighbors = []
         self.node_features = 0
         self.edge_mat = 0
-        self.y_a = -1
-        self.y_b = -1
-        self.lam = 0
+        # 删除混合增强相关字段
 
         self.max_neighbor = 0
 

@@ -146,31 +146,14 @@ class Trainer:
         support_current_sample_input_embs, support_current_sample_input_embs_selected = self.model.sample_input_GNN(
             [current_task], prompt_embeds, True)  # [N(K+Q), emb_size]
 
-        if self.args.gen_test_num == 0:
-            # 没有 mixup 数据：直接使用原始嵌入
-            support_data = support_current_sample_input_embs.detach()
-            support_data_mixup = None
-        else:
-            # 有 mixup 数据：需要 reshape 分离
-            data = support_current_sample_input_embs.reshape(self.args.N_way, self.args.K_shot + self.args.gen_test_num,
-                                                       self.model.sample_input_emb_size)
-            support_data = data[:, :self.args.K_shot, :].reshape(self.args.N_way * self.args.K_shot,
-                                                                              self.model.sample_input_emb_size).detach()
-            support_data_mixup = data[:, self.args.K_shot:self.args.K_shot + self.args.gen_test_num,
-                                                                              :].reshape(
-                                                                              self.args.N_way * self.args.gen_test_num, self.model.sample_input_emb_size).detach()  # .cpu().numpy()
+        # 仅使用原始支持集嵌入
+        support_data = support_current_sample_input_embs.detach()
 
-        support_label, support_label_mix_a, weight, support_label_mix_b = [], [], [], []
+        support_label = []
         for graphs in current_task['support_set']:
             support_label.append(np.array([graph.label for graph in graphs[:self.args.K_shot]]))
-            support_label_mix_a.append(np.array([graph.y_a for graph in graphs[self.args.K_shot:]]))
-            support_label_mix_b.append(np.array([graph.y_b for graph in graphs[self.args.K_shot:]]))
-            weight.append(np.array([graph.lam for graph in graphs[self.args.K_shot:]]))
 
         support_label = torch.LongTensor(np.hstack(support_label)).to(self.args.device)
-        support_label_mix_a = torch.LongTensor(np.hstack(support_label_mix_a)).to(self.args.device)
-        support_label_mix_b = torch.LongTensor(np.hstack(support_label_mix_b)).to(self.args.device)
-        weight = torch.FloatTensor(np.hstack(weight)).to(self.args.device)
 
         # 局部函数：训练线性分类器
         def _train_classifier():
@@ -184,19 +167,10 @@ class Trainer:
                 logits = self.log(support_data)
                 loss_ori = self.xent(logits, support_label)
 
-                # 只有当有mixup数据时才计算mixup损失
-                if self.args.gen_test_num > 0:
-                    # mixup data
-                    logits_mix = self.log(support_data_mixup)  # [Nxgen, class]
-                    loss_mix = (weight * self.xent(logits_mix, support_label_mix_a) + \
-                                (1 - weight) * self.xent(logits_mix, support_label_mix_b)).mean()
-                else:
-                    loss_mix = torch.tensor(0.).to(self.args.device)
-
                 l2_reg = torch.tensor(0.).to(self.args.device)
                 for param in self.log.parameters():
                     l2_reg += torch.norm(param)
-                loss_leg = loss_ori + loss_mix + 0.1 * l2_reg
+                loss_leg = loss_ori + 0.1 * l2_reg
 
                 loss_leg.backward()
                 self.opt.step()

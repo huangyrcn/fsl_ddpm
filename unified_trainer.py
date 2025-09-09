@@ -455,10 +455,9 @@ class UnifiedTrainer:
         )
 
         # ------- 支持集：取前 K-shot -------
-        support_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, True)  # [N_way*(K+gen), D]
-        total_support_samples = self.args.K_shot + self.args.gen_test_num
+        support_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, True)
         support_data = support_embs.reshape(
-            self.args.N_way, total_support_samples, self.model.sample_input_emb_size
+            self.args.N_way, -1, self.model.sample_input_emb_size
         )[:, :self.args.K_shot, :].reshape(
             self.args.N_way * self.args.K_shot, self.model.sample_input_emb_size
         ).detach()
@@ -494,13 +493,9 @@ class UnifiedTrainer:
 
         # ------- 训练线性分类器（与 baseline 保持一致）-------
         self.log = LogReg(self.model.sample_input_emb_size, self.args.N_way).to(self.args.device)
-        empty_long = torch.empty(0, dtype=torch.long, device=self.args.device)
         self._train_classifier(
             enhanced_support_data,
-            None,  # 不用 mixup
-            enhanced_support_labels,
-            empty_long, empty_long,
-            torch.empty(0, dtype=torch.float32, device=self.args.device)
+            enhanced_support_labels
         )
 
         # ------- 查询集评估 -------
@@ -634,18 +629,8 @@ class UnifiedTrainer:
             self.ldm.load_state_dict(best_state)
         self.ldm.eval()
         
-    def _train_classifier(self, support_data, support_data_mixup, support_label,
-                         support_label_mix_a, support_label_mix_b, weight):
-        """训练线性分类器（与 baseline 一致：优化器包含 prompt）
-        
-        Args:
-            support_data: 支持集数据
-            support_data_mixup: Mixup增强数据（可能为None）
-            support_label: 支持集标签
-            support_label_mix_a: Mixup数据标签A
-            support_label_mix_b: Mixup数据标签B
-            weight: Mixup权重
-        """
+    def _train_classifier(self, support_data, support_label):
+        """训练线性分类器（与 baseline 一致：优化器包含 prompt）"""
         self.log.train()
         
         # 与 baseline 相同：根据 use_prompt 选择是否一并优化 prompt
@@ -663,23 +648,14 @@ class UnifiedTrainer:
         for _ in range(500):
             opt.zero_grad()
             
-            # 原始支持数据损失
             logits = self.log(support_data)
             loss_ori = self.xent(logits, support_label)
             
-            # Mixup数据损失（仅在存在mixup数据时计算）
-            if self.args.gen_test_num > 0 and support_data_mixup is not None:
-                logits_mix = self.log(support_data_mixup)
-                loss_mix = (weight * self.xent(logits_mix, support_label_mix_a) + \
-                           (1 - weight) * self.xent(logits_mix, support_label_mix_b)).mean()
-            else:
-                loss_mix = torch.tensor(0.).to(self.args.device)
-                
             # L2正则化
             l2_reg = torch.tensor(0.).to(self.args.device)
             for param in self.log.parameters():
                 l2_reg += torch.norm(param)
-            loss_total = loss_ori + loss_mix + 0.1 * l2_reg
+            loss_total = loss_ori + 0.1 * l2_reg
             
             loss_total.backward()
             opt.step()

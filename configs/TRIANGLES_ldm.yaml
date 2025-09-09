@@ -18,8 +18,6 @@ weight_decay: 1.0e-07
 eval_interval: 100
 epoch_num: 5000
 use_select_sim: false
-gen_train_num: 0
-gen_test_num: 0
 save_test_emb: true
 
 num_token: 1
