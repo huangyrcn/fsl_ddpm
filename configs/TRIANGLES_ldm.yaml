@@ -5,21 +5,21 @@ baseline_mode: null
 N_way: 3
 K_shot: 5
 query_size: 10
-patience: 10
+patience: 5
 dropout: 0.5
 batch: 512  # 无效参数
 gin_layer: 3
 gin_hid: 128
 aug1: node_drop
 aug2: feature_mask
-t: 0.2
+t: 0.07
 lr: 0.001
 weight_decay: 1.0e-07
 eval_interval: 100
 epoch_num: 5000
 use_select_sim: false
-gen_train_num: 500
-gen_test_num: 20
+gen_train_num: 0
+gen_test_num: 0
 save_test_emb: true
 
 num_token: 1
@@ -32,26 +32,32 @@ sample_input_size: 256
 
 graph_pooling_type: sum
 
+# ckpt
 use_pretrained_encoder: false
 encoder_ckpt_path: ./savepoint/TRIANGLES_encoder.pkl
-# LDM增强配置
 
-use_ldm_augmentation: false
 use_pretrained_ldm: false # 是否跳过LDM训练并从ckpt加载
 ldm_ckpt_path: ./savepoint/TRIANGLES_ldm.pkl  # 预训练LDM权重（state_dict）
 
 # LDM相关参数  
-learning_rate_ldm: 1e-4
+learning_rate_ldm: 2e-4
 weight_decay_ldm: 1.0e-04
 num_epochs_ldm: 200000
 patience_ldm: 200
 time_steps: 50
-beta_start: 0.0001
-beta_end: 0.02 
 ldm_batch_size: 512
-ldm_ema_decay: 0.9              # LDM训练EMA衰减
+
+# 新版LDM参数
+ldm_predict: v                    # 'v' 或 'eps'，推荐 'v'
+ldm_unit_sphere: true            # 若encoder输出L2归一化，设true
+ldm_widths: [128, 256, 512]      # UNet宽度
+ldm_n_blocks: 2                  # 每阶段块数
+ldm_use_zero_mlp: true           # 是否使用Zero-MLP分支
+ldm_p_uncond: 0.1                # CFG训练时条件丢弃概率
+ldm_lambda_proto: 0.0            # 原型一致性正则权重
+ldm_guidance: 3.0                # CFG采样时的引导强度
 ldm_es_interval: 100             # LDM早停检查间隔（与打印间隔一致）
-condition_type: class_proto  # 训练时使用K-means，其他阶段使用真实标签聚类
+# 条件类型配置：固定使用 kmeans_proto (训练) 和 label_proto (生成)
 
 
 
@@ -59,10 +65,16 @@ condition_type: class_proto  # 训练时使用K-means，其他阶段使用真实
 batch_size_for_embedding: 512
 
 # 任务评估相关
-num_augmented_samples: 0
-refine_support_before_training: false
-refine_alpha: 0.7
-refine_use_slerp: false
+num_augmented_samples: 10
+
+# 任务级微调参数
+task_finetune_steps: 0           # 任务级微调步数，0表示不微调
+task_finetune_lr: 1e-3           # 微调学习率
+task_finetune_weight_decay: 1e-4 # 微调权重衰减
+task_finetune_cond_dropout: 0.1  # 微调时条件丢弃概率
+task_finetune_grad_clip: 1.0     # 梯度裁剪
+task_finetune_patience: 50       # 早停patience
+task_lambda_proto: 0.0           # 任务微调时原型一致性权重
 
 
 

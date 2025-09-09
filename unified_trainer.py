@@ -7,6 +7,8 @@ import numpy as np
 import os
 from copy import deepcopy
 from tqdm import tqdm
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
+import math
 import json
 import hashlib
 
@@ -17,8 +19,24 @@ import wandb
 from sklearn.cluster import KMeans
 
 
+class ZScore:
+    def __init__(self): 
+        self.mu = None
+        self.std = None
+    
+    def fit(self, X, eps=1e-6):
+        self.mu = X.mean(0, keepdim=True)
+        self.std = (X.var(0, unbiased=False, keepdim=True) + eps).sqrt()
+    
+    def fwd(self, X): 
+        return (X - self.mu) / self.std
+    
+    def inv(self, Z): 
+        return Z * self.std + self.mu
+
+
 from gnn_model import Model, Prompt, LogReg
-from train_ldm import LDM  
+from train_ldm import LDM, finetune_param_filter
 from dataset import Dataset
 from aug import aug_fea_mask, aug_drop_node, aug_fea_drop, aug_fea_dropout
 
@@ -53,6 +71,10 @@ class UnifiedTrainer:
         # 阶段2：LDM相关组件（延迟初始化）
         self.ldm = None
         self.ldm_optimizer = None
+        
+        # z-score标准化相关
+        self.use_znorm = bool(not getattr(args, "ldm_unit_sphere", False))
+        self.znorm = ZScore() if self.use_znorm else None
         
         # 评估相关：仅使用线性分类器
         in_dim = self.model.sample_input_emb_size
@@ -90,22 +112,22 @@ class UnifiedTrainer:
         if self.args.aug1 == 'identity':
             graph_aug1 = self.dataset.train_graphs
         elif self.args.aug1 == 'node_drop':
-            graph_aug1 = aug_drop_node(self.dataset.train_graphs)
+            graph_aug1 = aug_drop_node(self.dataset.train_graphs, self.args.seed)
         elif self.args.aug1 == 'feature_mask':
-            graph_aug1 = aug_fea_mask(self.dataset.train_graphs)
+            graph_aug1 = aug_fea_mask(self.dataset.train_graphs, self.args.seed)
         elif self.args.aug1 == 'feature_drop':
-            graph_aug1 = aug_fea_drop(self.dataset.train_graphs)
+            graph_aug1 = aug_fea_drop(self.dataset.train_graphs, self.args.seed)
         elif self.args.aug1 == 'feature_dropout':
-            graph_aug1 = aug_fea_dropout(self.dataset.train_graphs)
+            graph_aug1 = aug_fea_dropout(self.dataset.train_graphs, self.args.seed)
 
         if self.args.aug2 == 'node_drop':
-            graph_aug2 = aug_drop_node(graph_copy_2)
+            graph_aug2 = aug_drop_node(graph_copy_2, self.args.seed)
         elif self.args.aug2 == 'feature_mask':
-            graph_aug2 = aug_fea_mask(graph_copy_2)
+            graph_aug2 = aug_fea_mask(graph_copy_2, self.args.seed)
         elif self.args.aug2 == 'feature_drop':
-            graph_aug2 = aug_fea_drop(self.dataset.train_graphs)
+            graph_aug2 = aug_fea_drop(self.dataset.train_graphs, self.args.seed)
         elif self.args.aug2 == 'feature_dropout':
-            graph_aug2 = aug_fea_dropout(self.dataset.train_graphs)
+            graph_aug2 = aug_fea_dropout(self.dataset.train_graphs, self.args.seed)
 
         print("图增强完成!")
         
@@ -163,27 +185,36 @@ class UnifiedTrainer:
         return loss
         
     def init_ldm_components(self):
-        """初始化LDM相关组件"""
+        """初始化LDM相关组件（新版LDM）"""
         print("=== 初始化LDM组件 ===")
-        
-        # 直接使用模型公开的embedding维度配置
         embedding_dim = self.model.sample_input_emb_size
-            
         print(f"检测到embedding维度: {embedding_dim}")
-        
-        # 初始化LDM，基于encoder的输出维度
+
+        # 一些合理默认超参（没有就用默认）
+        predict_type   = getattr(self.args, "ldm_predict", "v")          # 'v' 或 'eps'
+        unit_sphere    = getattr(self.args, "ldm_unit_sphere", False)    # 默认False，使用z-score
+        widths         = getattr(self.args, "ldm_widths", (128, 256, 512))
+        n_blocks       = getattr(self.args, "ldm_n_blocks", 2)
+        use_zero_mlp   = getattr(self.args, "ldm_use_zero_mlp", True)
+        time_steps     = int(self.args.time_steps)
+
         self.ldm = LDM(
-            self.args.device,
-            embedding_dim,  # 使用encoder的输出维度
-            self.args.time_steps,
-            self.args.beta_start,
-            self.args.beta_end
+            device=self.args.device,
+            latent_dim=embedding_dim,
+            timesteps=time_steps,
+            cond_dim=embedding_dim,       # 条件就是同维嵌入原型
+            predict=predict_type,
+            unit_sphere=unit_sphere,
+            self_condition=True,
+            widths=widths,
+            n_blocks_per_stage=n_blocks,
+            use_zero_mlp=use_zero_mlp
         ).to(self.args.device)
-        
+
         self.ldm_optimizer = torch.optim.AdamW(
             self.ldm.parameters(),
-            lr=self.args.learning_rate_ldm,
-            weight_decay=self.args.weight_decay_ldm
+            lr=getattr(self.args, "learning_rate_ldm", 2e-4),
+            weight_decay=getattr(self.args, "weight_decay_ldm", 1e-4)
         )
         
         print("LDM组件初始化完成!")
@@ -203,8 +234,6 @@ class UnifiedTrainer:
         print("=== 收集训练集embeddings ===")
         
         self.model.eval()
-        all_embeddings = []
-        all_labels = []
         
         if self.args.use_prompt:
             self.prompt.eval()
@@ -214,68 +243,52 @@ class UnifiedTrainer:
         
         with torch.no_grad():
             all_graphs = self.dataset.train_graphs
-            self.training_embeddings = self.model.encode_graphs(all_graphs, prompt_embeds)  # [N, D]
-            self.training_labels = torch.tensor([graph.label for graph in all_graphs], device=self.args.device)
-    
-        # 根据参数选择条件类型
-        condition_type = self.args.condition_type  # 默认为self_labeling
-        
-        if condition_type == 'self_labeling':
-            # 使用样本自己作为条件
-            self.conditions = self.training_embeddings.clone()
-            # 注意：这里不设置self.prototypes，但在可视化时会重新计算kmeans
-            
-        elif condition_type == 'class_proto':
-            # 训练阶段：使用K-means聚类获取类别原型
-            # 先归一化embeddings，再进行聚类
-            normalized_embeddings = F.normalize(self.training_embeddings, dim=1)
-            kmeans = KMeans(n_init=10, n_clusters=self.args.train_classes_num, random_state=42)
-            cluster_labels = kmeans.fit_predict(normalized_embeddings.cpu().detach().numpy())
-            prototypes = torch.tensor(
-                kmeans.cluster_centers_, dtype=torch.float, device=self.args.device
-            )
-            # 对聚类中心再次归一化
-            prototypes = F.normalize(prototypes, dim=1)
-            self.prototypes = prototypes
+            self.training_embeddings = self.model.encode_graphs(all_graphs, prompt_embeds)  # [N,D]
+            self.training_labels = torch.tensor([g.label for g in all_graphs], device=self.args.device)
 
-            # 计算每个样本的类别 Prototype 作为条件
-            cluster_labels = torch.tensor(cluster_labels, dtype=torch.long, device=self.args.device)
-            self.conditions = prototypes[cluster_labels]
-            
-            print(f"训练阶段：K-Means聚类完成，prototypes形状: {prototypes.shape}")
-            
+        # —— 拟合 z-score & 转 z 空间 ——
+        if self.use_znorm:
+            self.znorm.fit(self.training_embeddings)
+            print(f"[Z] mean={self.znorm.fwd(self.training_embeddings).mean().item():.3f}, "
+                  f"std={self.znorm.fwd(self.training_embeddings).std().item():.3f}")
+            self.training_embeddings_z = self.znorm.fwd(self.training_embeddings)
         else:
-            raise ValueError(f"不支持的condition_type: {condition_type}，支持的类型: self_labeling, class_proto")
-        
-        # 对条件进行归一化
-        self.conditions = F.normalize(self.conditions, dim=1)
+            self.training_embeddings_z = self.training_embeddings
+
+        # —— z 空间做 KMeans/条件 ——
+        kmeans = KMeans(n_init=10, n_clusters=self.args.train_classes_num, random_state=42)
+        cluster_labels = kmeans.fit_predict(self.training_embeddings_z.cpu().numpy())
+        prototypes_z = torch.tensor(kmeans.cluster_centers_, dtype=torch.float, device=self.args.device)
+        self.kmeans_prototypes_z = prototypes_z
+        self.kmeans_prototypes   = self.znorm.inv(prototypes_z) if self.use_znorm else prototypes_z
+
+        # 直接使用 kmeans_proto 作为训练条件
+        cl_t = torch.tensor(cluster_labels, dtype=torch.long, device=self.args.device)
+        self.conditions_z = prototypes_z[cl_t]
         
     def train_ldm(self):
         """训练LDM，基于encoder的embeddings"""
         print("=== 开始训练LDM ===")
         
-        # 根据条件类型获取条件数据
-        conditions = self.conditions
-        condition_type = self.args.condition_type
+        # 使用 kmeans_proto 作为训练条件
+        conditions_z = self.conditions_z
         
-        print(f"训练数据: {self.training_embeddings.shape[0]} 个embeddings")
-        print(f"条件数据: {conditions.shape[0]} 个条件")
+        print(f"训练数据: {self.training_embeddings_z.shape[0]} 个embeddings")
+        print(f"条件数据: {conditions_z.shape[0]} 个条件")
         
-        decay = float(self.args.ldm_ema_decay)
-        check_interval = int(self.args.ldm_es_interval)
-        ema_loss = None
-        best_ema = float('inf')
+        best_loss = float('inf')
         patience_count = 0
         patience = self.args.patience_ldm
+        check_interval = int(self.args.ldm_es_interval)
         
         # 创建进度条
         pbar = tqdm(range(1, self.args.num_epochs_ldm + 1), desc="LDM Training")
         
         for epoch in pbar:
             # 随机打乱数据
-            perm = torch.randperm(self.training_embeddings.shape[0])
-            shuffled_embeddings = self.training_embeddings[perm]
-            shuffled_conditions = conditions[perm]
+            perm = torch.randperm(self.training_embeddings_z.shape[0])
+            shuffled_embeddings = self.training_embeddings_z[perm]
+            shuffled_conditions = conditions_z[perm]
             
             epoch_loss = 0
             batch_size = self.args.ldm_batch_size
@@ -298,19 +311,12 @@ class UnifiedTrainer:
             # 记录到 wandb（如果启用）
             if wandb.run is not None:
                 wandb.log({
-                    "ldm_loss": avg_loss,
-                    "ldm_ema_loss": ema_loss if ema_loss is not None else avg_loss
+                    "ldm_loss": avg_loss
                 }, step=epoch)
             
-            # EMA更新
-            if ema_loss is None:
-                ema_loss = avg_loss
-            else:
-                ema_loss = decay * ema_loss + (1.0 - decay) * avg_loss
-
-            # 每个epoch都进行早停检查（基于EMA）
-            if ema_loss < best_ema:
-                best_ema = ema_loss
+            # 简单的早停检查（基于当前loss）
+            if avg_loss < best_loss:
+                best_loss = avg_loss
                 patience_count = 0
                 torch.save(
                     self.ldm.state_dict(),
@@ -324,7 +330,6 @@ class UnifiedTrainer:
                     wandb.log({
                         "ldm_epoch": epoch,
                         "ldm_avg_loss": avg_loss,
-                        "ldm_ema_loss": ema_loss,
                         "ldm_patience_count": patience_count,
                         "ldm_patience": patience
                     }, step=epoch)
@@ -332,21 +337,21 @@ class UnifiedTrainer:
                 break
         
     def _train_ldm_step(self, z, conditions):
-        """LDM训练步骤（使用ldm.loss方法）
-        
-        Args:
-            z: 输入embeddings [B, D]
-            conditions: 条件embeddings [B, D]
-            
-        Returns:
-            loss: LDM训练损失值
-        """
+        """新版LDM训练一步（无control，支持lambda_proto/proto）"""
         self.ldm.train()
         self.ldm_optimizer.zero_grad()
-        
-        # 使用ldm.loss方法计算损失
-        loss = self.ldm.loss(z, conditions, p_uncond=0.1, control=None)  # 训练时不使用control
-        
+
+        p_uncond     = float(getattr(self.args, "ldm_p_uncond", 0.1))
+        lambda_proto = float(getattr(self.args, "ldm_lambda_proto", 0.0))
+        # 用 "条件本身" 作为原型一致性目标（也可以用你单独算的原型张量）
+        proto = conditions
+
+        loss = self.ldm.loss(
+            x0=z, cond=conditions,
+            p_uncond=p_uncond,
+            lambda_proto=lambda_proto,
+            proto=proto
+        )
         loss.backward()
         self.ldm_optimizer.step()
         
@@ -355,20 +360,18 @@ class UnifiedTrainer:
 
 
         
-    def test_model(self, num_augmented_samples=0, refine_support_before_training=False, ldm_model=None, test_name=None):
+    def test_model(self, num_augmented_samples=0, ldm_model=None, test_name=None):
         """统一的测试函数"""
         # 统一命名
         test_name = test_name or ("LDM增强测试" if num_augmented_samples > 0 else "原始Encoder测试")
         self.model.eval()
 
-        # 是否需要LDM：当需要refine或需要生成增强时
-        need_ldm = bool(refine_support_before_training or (num_augmented_samples > 0))
+        # 是否需要LDM：当需要生成增强时
+        need_ldm = bool(num_augmented_samples > 0)
 
         # 根据 refine/augmentation 情况，统一打印更清晰的评估模式
         if need_ldm:
-            if refine_support_before_training and num_augmented_samples == 0:
-                mode_label = "仅Refine评估（无增强采样）"
-            elif num_augmented_samples > 0:
+            if num_augmented_samples > 0:
                 mode_label = f"LDM增强评估（每样本生成{num_augmented_samples}）"
             else:
                 mode_label = "LDM评估"
@@ -390,7 +393,7 @@ class UnifiedTrainer:
         end_test_idx = start_test_idx + total_tasks * (self.args.N_way * self.args.query_size)
         
         while start_test_idx < end_test_idx:
-            test_acc = self._evaluate_one_task_with_ldm(start_test_idx, num_augmented_samples, ldm_model, refine_support_before_training, start_test_idx=start_test_idx)
+            test_acc = self._evaluate_one_task_with_ldm(start_test_idx, num_augmented_samples, ldm_model, start_test_idx=start_test_idx)
             test_accs.append(test_acc)
             
             # 根据测试类型记录不同的日志信息
@@ -423,201 +426,210 @@ class UnifiedTrainer:
     
 
         
-    def _evaluate_one_task_with_ldm(self, test_idx, num_augmented_samples, ldm_model, refine_support_before_training, start_test_idx=None):
-        """评估一个few-shot任务"""
+    def _evaluate_one_task_with_ldm(
+        self,
+        test_idx: int,
+        num_augmented_samples: int,
+        ldm_model,
+        start_test_idx=None,  # 兼容你原来的签名
+    ):
+        """评估一个few-shot任务（新版LDM流程）
+        流程：采样任务 → (可选) per-task微调 → (可选) refine支持集 → (可选) 条件生成增强 → 线性分类评测
+        """
         self.model.eval()
         
-        # 获取prompt embeddings（评估期不使用 prompt，统一零向量）
+        # 选择用于采样的模型
+        ldm_for_sampling = ldm_model or self.ldm
+
+        # 评估期不使用 prompt（置零）
         prompt_embeds = torch.zeros(self.args.num_token, self.args.node_fea_size).to(self.args.device)
-            
-        # 采样当前任务
+
+        # 取一个任务
         first_N_class_sample = np.array(list(range(self.dataset.test_classes_num)))
         current_task = self.dataset.sample_one_task(
-            self.dataset.test_tasks, first_N_class_sample,
-            K_shot=self.args.K_shot, query_size=self.args.query_size,
+            self.dataset.test_tasks,
+            first_N_class_sample,
+            K_shot=self.args.K_shot,
+            query_size=self.args.query_size,
             test_start_idx=test_idx
         )
-        
-        # 获取支持集embeddings并处理维度
-        support_current_sample_input_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, True)
+
+        # ------- 支持集：取前 K-shot -------
+        support_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, True)  # [N_way*(K+gen), D]
         total_support_samples = self.args.K_shot + self.args.gen_test_num
-        
-        # 重塑支持集数据：只取前K_shot个样本
-        support_data = support_current_sample_input_embs.reshape(
+        support_data = support_embs.reshape(
             self.args.N_way, total_support_samples, self.model.sample_input_emb_size
         )[:, :self.args.K_shot, :].reshape(
             self.args.N_way * self.args.K_shot, self.model.sample_input_emb_size
         ).detach()
-        
-        # 获取支持集标签
+
+        # 支持集标签
         support_label = []
         for graphs in current_task['support_set']:
             support_label.append(np.array([graph.label for graph in graphs[:self.args.K_shot]]))
         support_label = torch.LongTensor(np.hstack(support_label)).to(self.args.device)
-        
-        # 第一步：refine支持集（如果启用）
-        if refine_support_before_training:
-            support_data_for_enhancement = self.refine_embeddings_with_ldm(
-                embeddings=support_data,
-                labels=support_label,
-                ldm_model=ldm_model,
-                alpha=self.args.refine_alpha,
-                use_slerp=self.args.refine_use_slerp,
-                batch_size=self.args.ldm_batch_size
+
+        # ------- (可选) 任务级微调 LDM（只训FiLM/Zero-MLP） -------
+        # 若传入了 ldm_model 且配置步数>0，则在当前任务支持集上做少量步的适配
+        if (ldm_for_sampling is not None) and int(getattr(self.args, "task_finetune_steps", 0)) > 0:
+            # 注意：_task_level_finetune 使用 self.ldm；主程序中 ldm_model = self.ldm，因此一致
+            self._task_level_finetune(
+                support_data=support_data,
+                support_labels=support_label,
+                task_id=test_idx // max(1, (self.args.N_way * self.args.query_size))
             )
-        else:
-            support_data_for_enhancement = support_data
 
-        # 扩充支持集
+        # 不再执行 refine，直接使用原始支持集
+        support_data_for_enh = support_data
+
+        # ------- (可选) 条件生成增强 -------
         enhanced_support_data, enhanced_support_labels = self.generate_augmented_embeddings(
-            embeddings=support_data_for_enhancement,
+            embeddings=support_data_for_enh,
             labels=support_label,
-            num_to_generate=num_augmented_samples,
-            ldm_model=ldm_model,
+            num_to_generate=int(num_augmented_samples),
+            ldm_model=ldm_for_sampling,
             device=self.args.device,
-            condition_type=self.args.condition_type
+            condition_type="label_proto"
         )
 
-        # 训练分类器
+        # ------- 训练线性分类器（与 baseline 保持一致）-------
         self.log = LogReg(self.model.sample_input_emb_size, self.args.N_way).to(self.args.device)
-        empty_tensor = torch.empty(0, dtype=torch.long, device=self.args.device)
+        empty_long = torch.empty(0, dtype=torch.long, device=self.args.device)
         self._train_classifier(
-            enhanced_support_data, None, enhanced_support_labels,
-            empty_tensor, empty_tensor, torch.empty(0, dtype=torch.float32, device=self.args.device)
+            enhanced_support_data,
+            None,  # 不用 mixup
+            enhanced_support_labels,
+            empty_long, empty_long,
+            torch.empty(0, dtype=torch.float32, device=self.args.device)
         )
-        
-        # 评估查询集
-        query_current_sample_input_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, False)
-        query_data = query_current_sample_input_embs.reshape(
+
+        # ------- 查询集评估 -------
+        query_embs, _ = self.model.sample_input_GNN([current_task], prompt_embeds, False)
+        query_data = query_embs.reshape(
             self.args.N_way, self.args.query_size, self.model.sample_input_emb_size
         ).reshape(self.args.N_way * self.args.query_size, self.model.sample_input_emb_size).detach()
-        
-        # 获取查询集标签
+
         query_label = []
         for graphs in current_task['query_set']:
             query_label.append(np.array([graph.label for graph in graphs]))
         query_label = torch.LongTensor(np.hstack(query_label)).to(self.args.device)
-        
-        # 处理填充数据
-        if current_task['append_count'] != 0:
+
+        # 处理填充数据（按你的 Dataset 接口）
+        if current_task.get('append_count', 0) != 0:
             query_len = query_label.shape[0]
             query_data = query_data[:query_len - current_task['append_count'], :]
             query_label = query_label[:query_len - current_task['append_count']]
-        
-        # 预测和计算准确率
+
+        # 预测
         logits = self.log(query_data)
         preds = torch.argmax(logits, dim=1)
         acc = torch.sum(preds == query_label).float() / query_label.shape[0]
-        
-        return acc.cpu().numpy()
+        return acc.item()
 
     def _task_level_finetune(self, support_data, support_labels, task_id=None):
-        """任务级 LDM 微调：适配当前任务的简单微调
-        
-        Args:
-            support_data: 支持集embeddings [S, D]
-            support_labels: 支持集标签 [S]
-            task_id: 任务ID，用于进度条显示
-        """
+        """任务级 LDM 微调：只训 FiLM/Zero-MLP 小分支"""
         steps = int(self.args.task_finetune_steps)
         if steps <= 0:
             return
 
-        # 1) 冻结主干，仅训控制分支
+        # 1) 冻结主干，只开小分支
         trainable = []
         for n, p in self.ldm.named_parameters():
-            p.requires_grad = False
-            if 'diffusion.controlnet' in n:
-                p.requires_grad = True
-                trainable.append(p)
+            flag = finetune_param_filter(n)  # 只启用 film/cond_proj/zero/gate/（可选lora）
+            p.requires_grad_(flag)
+            if flag: trainable.append(p)
 
-        # 2) 根据条件类型选择条件策略
-        condition_type = self.args.condition_type
-        
+        # 2) 构造条件：使用类别原型（z空间）
+        support_z = self.znorm.fwd(support_data) if self.use_znorm else support_data
         with torch.no_grad():
-            if condition_type == 'class_proto':
-                # 测试阶段：使用真实标签聚类生成类别原型
-                unique_labels = torch.unique(support_labels)
-                label_prototypes = {}
-                
-                # 为每个类别计算原型
-                for label in unique_labels:
-                    label_mask = (support_labels == label)
-                    if label_mask.sum() > 0:
-                        label_embs = support_data[label_mask]
-                        # 先归一化，再均值，再归一化
-                        normalized_embs = F.normalize(label_embs, dim=1)
-                        prototype = F.normalize(normalized_embs.mean(dim=0, keepdim=True), dim=1)
-                        label_prototypes[label.item()] = prototype
-                
-                # 为每个样本分配对应的类别原型
-                cond_per_sample = torch.zeros_like(support_data)
-                for i, label in enumerate(support_labels):
-                    label_key = label.item()
-                    if label_key in label_prototypes:
-                        cond_per_sample[i] = label_prototypes[label_key]
-                    else:
-                        # 如果没有原型，使用样本自己
-                        cond_per_sample[i] = F.normalize(support_data[i:i+1], dim=1).squeeze(0)
-                
-                # 控制信号使用类别原型
-                control_in = cond_per_sample.clone()
-                
-            else:
-                # 其他条件类型：使用样本自己作为条件
-                cond_per_sample = F.normalize(support_data, dim=1)
-                control_in = cond_per_sample.clone()
+            cond_z = torch.zeros_like(support_z)
+            for cls in torch.unique(support_labels):
+                m = (support_labels == cls)
+                if m.any():
+                    cond_z[m] = support_z[m].mean(0, keepdim=True)
 
-        # 3) 优化器（仅本地使用）
-        lr = float(self.args.task_finetune_lr)  # 降低学习率
-        wd = float(self.args.task_finetune_weight_decay)
+        # 3) 优化器
+        lr = float(getattr(self.args, "task_finetune_lr", 1e-3))
+        wd = float(getattr(self.args, "task_finetune_weight_decay", 1e-4))
         opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
+        # 学习率调度：ReduceLROnPlateau，按当前损失自适应降低LR
+        scheduler = ReduceLROnPlateau(
+            opt, mode='min', factor=0.5, patience=50, threshold=1e-3,
+            cooldown=0, min_lr=1e-7, verbose=True
+        )
 
         self.ldm.train()
+        drop_p    = float(getattr(self.args, "task_finetune_cond_dropout", 0.1))
+        grad_clip = float(getattr(self.args, "task_finetune_grad_clip", 1.0))
+        patience  = int(getattr(self.args, "task_finetune_patience", 50))
+        lambda_proto = float(getattr(self.args, "task_lambda_proto", 0.0))
 
-        drop_p   = float(self.args.task_finetune_cond_dropout)  # 降低dropout
-        grad_clip = float(self.args.task_finetune_grad_clip)
-        patience  = int(self.args.task_finetune_patience)
+        # 体检：记录可训练参数数量与初始LR
+        num_trainable = sum(p.numel() for p in trainable if p.requires_grad)
+        print(f"[finetune] trainable params: {num_trainable}")
+        if wandb.run is not None:
+            wandb.log({f"task_{task_id}_lr": opt.param_groups[0]['lr']})
 
-        # 早停跟踪
-        best_loss  = float('inf')
-        best_state = None
-        wait = 0
+        # 稳压超参
+        accum_steps   = int(getattr(self.args, "task_finetune_accum_steps", 4))
+        micro_repeats = int(getattr(self.args, "task_finetune_micro_repeats", 4))
+        ema_alpha     = float(getattr(self.args, "task_finetune_ema_alpha", 0.98))
+        ema_loss = None
 
+        best_loss, best_state, wait = float('inf'), None, 0
         pbar = tqdm(range(steps), desc=f"Task Finetune ({task_id})", position=1, leave=False)
         for step in pbar:
-            # 单次构造 cond（只做你的一层dropout；loss里p_uncond=0.0避免二次置零）
-            cond_in = cond_per_sample.clone()
-            if drop_p > 0:
-                mask = (torch.rand(cond_in.size(0), device=cond_in.device) < drop_p).float().unsqueeze(-1)
-                cond_in = cond_in * (1 - mask)
+            total_loss = 0.0
+            # micro-repeats：同批多次前向（不同 cond dropout 面具），均值降噪
+            for _ in range(micro_repeats):
+                cond_in = cond_z.clone()
+                if drop_p > 0:
+                    mask = (torch.rand(cond_in.size(0), device=cond_in.device) < drop_p).float().unsqueeze(-1)
+                    cond_in = cond_in * (1 - mask)
 
-            loss = self.ldm.loss(support_data, cond_in, p_uncond=0.0, control=control_in)
+                loss_once = self.ldm.loss(
+                    x0=support_z,
+                    cond=cond_in,
+                    p_uncond=0.0,
+                    lambda_proto=lambda_proto,
+                    proto=cond_z
+                )
+                total_loss = total_loss + loss_once
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
-            opt.step()
+            loss = total_loss / float(max(1, micro_repeats))
 
-            cur = loss.item()
-            if cur < best_loss:
-                best_loss = cur
-                wait = 0
-                # 记住最佳权重（轻量任务微调，state_dict拷贝成本很低）
+            # 梯度累积
+            (loss / float(max(1, accum_steps))).backward()
+
+            cur = float(loss.item())
+            ema_loss = cur if ema_loss is None else (ema_alpha * ema_loss + (1.0 - ema_alpha) * cur)
+
+            if (step + 1) % max(1, accum_steps) == 0:
+                torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                # 调度器用 EMA 更稳
+                scheduler.step(ema_loss)
+
+            pbar.set_postfix({'Loss': f'{cur:.4f}', 'EMA': f'{(ema_loss if ema_loss is not None else cur):.4f}'})
+            if wandb.run is not None:
+                wandb.log({
+                    f"task_{task_id}_loss": cur,
+                    f"task_{task_id}_ema_loss": (ema_loss if ema_loss is not None else cur),
+                    f"task_{task_id}_lr": opt.param_groups[0]['lr'],
+                })
+
+            # 早停依据使用 EMA
+            score_for_es = ema_loss if ema_loss is not None else cur
+            if score_for_es < best_loss:
+                best_loss, wait = score_for_es, 0
                 from copy import deepcopy
                 best_state = deepcopy(self.ldm.state_dict())
             else:
                 wait += 1
-                
-            # 日志：每一步都提交到wandb
-            pbar.set_postfix({'Loss': f'{cur:.4f}'})
-            if wandb.run is not None:
-                wandb.log({f"task_{task_id}_loss": cur, f"task_{task_id}_step": step})
+                if wait >= patience:
+                    break
 
-            if wait >= patience:
-                break
-
-        # 用最佳步的参数做后续采样/增强
         if best_state is not None:
             self.ldm.load_state_dict(best_state)
         self.ldm.eval()
@@ -689,128 +701,81 @@ class UnifiedTrainer:
         self.log.eval()
         
  
-    def generate_augmented_embeddings(self, embeddings: torch.Tensor, labels: torch.Tensor,
-                                      num_to_generate: int, *, ldm_model, device, condition_type: str):
-        """使用给定的 LDM 模型对输入嵌入进行扩充。
-        - embeddings: [N, D]
-        - labels:     [N]
-        - num_to_generate: 每类/每样本生成的样本数（由 condition_type 决定粒度）
-        - ldm_model:  采样用的 LDM 实例
-        - device:     目标设备
-        - condition_type: 'class_proto' 或 'self_labeling'
-        返回 (enhanced_embeddings, enhanced_labels)。当 num_to_generate<=0 原样返回。
-        """
-        if num_to_generate <= 0:
+    def generate_augmented_embeddings(self, embeddings, labels, num_to_generate, *, ldm_model, device, condition_type):
+        if (num_to_generate <= 0) or (ldm_model is None):
             return embeddings, labels
+        D = embeddings.shape[1]
 
-        embedding_dim = embeddings.shape[1]
+        # → z 空间
+        emb_z = self.znorm.fwd(embeddings) if self.use_znorm else embeddings
 
-        gen_batches: list[torch.Tensor] = []
-        gen_labels: list[int] = []
-
-        if condition_type == 'class_proto':
-            prototypes = {}
+        # 条件（z 空间，建议 label_proto = 类均值）
+        if condition_type == 'label_proto':
+            conds_z = torch.zeros_like(emb_z)
             for cls in torch.unique(labels):
-                mask = (labels == cls)
-                if mask.any():
-                    z = embeddings[mask]
-                    proto = F.normalize(F.normalize(z, dim=1).mean(dim=0, keepdim=True), dim=1)
-                    prototypes[int(cls.item())] = proto
-            for cls_id, proto in prototypes.items():
-                cond = proto.repeat(num_to_generate, 1)
-                with torch.no_grad():
-                    z_gen = ldm_model.sample(shape=(num_to_generate, embedding_dim), cond=cond, control=cond)
-                gen_batches.append(z_gen)
-                gen_labels.extend([cls_id] * num_to_generate)
+                m = (labels == cls)
+                if m.any():
+                    proto_z = emb_z[m].mean(0, keepdim=True)
+                    conds_z[m] = proto_z
         else:
-            for i in range(len(embeddings)):
-                cond = F.normalize(embeddings[i:i+1], dim=1).repeat(num_to_generate, 1)
-                with torch.no_grad():
-                    z_gen = ldm_model.sample(shape=(num_to_generate, embedding_dim), cond=cond, control=cond)
-                gen_batches.append(z_gen)
-                gen_labels.extend([int(labels[i].item())] * num_to_generate)
+            conds_z = emb_z
 
-        if not gen_batches:
-            return embeddings, labels
+        # 采样（加大多样性：simple_var=False）
+        expanded_conds_z = conds_z.repeat_interleave(num_to_generate, dim=0)
+        expanded_labels  = labels.repeat_interleave(num_to_generate, dim=0)
+        
+        with torch.no_grad():
+            temp = float(getattr(self.args, "ldm_aug_temp", 0.9))
+            simp = bool(getattr(self.args, "ldm_aug_simple_var", False))
+            guid = float(getattr(self.args, "ldm_guidance", 1.8))
 
-        gen_all = torch.cat(gen_batches, dim=0)
-        gen_y = torch.tensor(gen_labels, device=device, dtype=torch.long)
-        return torch.cat([embeddings, gen_all], dim=0), torch.cat([labels, gen_y], dim=0)
+            init_r = emb_z.norm(dim=1).repeat_interleave(num_to_generate, dim=0)
+
+            z_gen = ldm_model.sample(
+                shape=(len(expanded_conds_z), D),
+                cond=expanded_conds_z,
+                guidance=guid,
+                simple_var=simp,
+                temp=temp,
+                init_match_radius=init_r
+            )
+
+        # ← 还原到原空间
+        z_gen_orig = self.znorm.inv(z_gen) if self.use_znorm else z_gen
+        return torch.cat([embeddings, z_gen_orig], 0), torch.cat([labels, expanded_labels], 0)
     
+    @torch.no_grad()
+    def refine_embeddings_with_ldm(self, embeddings, labels, ldm_model, alpha=0.3, use_slerp=False, batch_size=256):
+        ldm_model.eval()
+        T = ldm_model.timesteps
+        t_ref = max(1, int(0.1 * T))
+        x0z_all = self.znorm.fwd(embeddings) if self.use_znorm else embeddings
+        outs = []
+        for i in range(0, x0z_all.size(0), batch_size):
+            x0_z = x0z_all[i:i+batch_size]
+            B = x0_z.size(0)
+            t = torch.full((B,), t_ref, dtype=torch.long, device=x0_z.device)
 
-    def refine_embeddings_with_ldm(
-        self,
-        embeddings: torch.Tensor,            # [S, D] 支持集/任意待修饰嵌入
-        labels: torch.Tensor,                # [S]    对应标签（>=0）
-        ldm_model,                           # LDM模型实例
-        alpha: float = 0.7,                 # 修饰强度(保留度)：alpha=0.7 => 70%原始 + 30%生成
-        use_slerp: bool = False,             # True: 球面插值；False: 线性插值
-        batch_size: int = 64                # 采样mini-batch大小
-    ) -> torch.Tensor:
-        """
-        仅做"支持集去噪/修饰"，不做可视化、不改动任务结构。
-        条件使用【类原型的球面均值】（先归一化再均值再归一化），与对比学习的余弦几何一致。
-        返回 refined_embeddings（不做归一化，由调用方根据需要决定）。
-        
-        Args:
-            embeddings: 输入嵌入 [S, D]
-            labels: 对应标签 [S]
-            ldm_model: LDM模型实例
-            alpha: 修饰强度，默认0.7
-            use_slerp: 是否使用球面插值，默认False
-            batch_size: 批处理大小，默认64
-        """
-        device = embeddings.device
-        S, D = embeddings.size()
-
-        # 过滤非法标签（如 <0），保持原样
-        valid_mask = labels >= 0
-        refined = embeddings.clone()
-
-        # 计算"原始原型"（球面均值：norm→mean→norm）
-        classes = torch.unique(labels[valid_mask])
-        protos = {}
-        for c in classes:
-            m = (labels == c)
-            if m.any():
-                zc = F.normalize(embeddings[m], dim=1)
-                mu = F.normalize(zc.mean(dim=0, keepdim=True), dim=1)
-                protos[int(c.item())] = mu
-
-        # slerp（可选）
-        def _slerp(z0: torch.Tensor, z1: torch.Tensor, t: float, eps: float = 1e-7):
-            z0 = F.normalize(z0, dim=1); z1 = F.normalize(z1, dim=1)
-            cos = (z0 * z1).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
-            theta = torch.acos(cos)
-            sin = torch.sin(theta).clamp_min(eps)
-            return (torch.sin((1 - t) * theta) / sin) * z0 + (torch.sin(t * theta) / sin) * z1
-
-        # 按类别成组采样并修饰
-        for c, proto in protos.items():
-            idx = torch.nonzero((labels == c), as_tuple=False).squeeze(1)
-            if idx.numel() == 0:
-                continue
-
-            cond_full = proto.repeat(idx.numel(), 1)  # [Nc, D]
-            gens = []
-            for i in range(0, idx.numel(), batch_size):
-                cond_b = cond_full[i:i+batch_size]
-                gen_b = ldm_model.sample(shape=(cond_b.size(0), D), cond=cond_b, control=cond_b)
-                gens.append(gen_b)
-            Gc = torch.cat(gens, dim=0)               # [Nc, D]
-            Zc = embeddings.index_select(0, idx)      # [Nc, D]
-
-            if use_slerp:
-                Rc = _slerp(Zc, Gc, t=1.0 - alpha)    # 更贴近余弦几何
+            # 条件：类均值（z 空间）
+            if labels is not None:
+                yb = labels[i:i+B]
+                cond_z = torch.zeros_like(x0_z)
+                for cls in torch.unique(yb):
+                    m = (yb == cls)
+                    if m.any():
+                        cond_z[m] = x0_z[m].mean(0, keepdim=True)
             else:
-                Rc = alpha * Zc + (1.0 - alpha) * Gc  # 线性插值
+                cond_z = x0_z
 
-            refined.index_copy_(0, idx, Rc)
+            x_t, _ = ldm_model.addnoise(x0_z, t)
+            out = ldm_model._predict_model_out(x_t, t, cond=cond_z, guidance=float(getattr(self.args,"ldm_guidance",1.8)), x0_sc=torch.zeros_like(x_t))
+            x0_hat_z = ldm_model._x0_from_v(x_t, t, out) if ldm_model.predict=='v' else ldm_model._x0_from_eps(x_t, t, out)
+            x_ref_z = (1 - alpha) * x0_z + alpha * x0_hat_z  # 线性插值
+            outs.append(x_ref_z)
+        zref = torch.cat(outs, 0)
+        return self.znorm.inv(zref) if self.use_znorm else zref
 
-        # 非法标签样本保持原样（已在 refined.clone()）
-        return refined
-        
-    def visualize_refine_aug(self, save_path=None):
+    def visualize_test_data(self, save_path=None):
         """Refine → Augment (from refined) → Visualize on one t-SNE figure."""
         import numpy as np
         import matplotlib.pyplot as plt
@@ -837,10 +802,11 @@ class UnifiedTrainer:
         y_sup = torch.LongTensor(np.hstack([[g.label for g in gs] for gs in task['support_set']])).to(self.args.device)
 
         # refine 支持集（一次）
+        ldm_for_refine = self.ldm
         z_ref = self.refine_embeddings_with_ldm(
             embeddings=z_sup,
             labels=y_sup,
-            ldm_model=self.ldm,
+            ldm_model=ldm_for_refine,
             alpha=float(self.args.refine_alpha),
             use_slerp=bool(self.args.refine_use_slerp),
             batch_size=int(self.args.ldm_batch_size)
@@ -861,9 +827,9 @@ class UnifiedTrainer:
                 embeddings=z_ref.detach(),
                 labels=y_sup,
                 num_to_generate=num_aug,
-                ldm_model=self.ldm,
+                ldm_model=ldm_for_refine,
                 device=self.args.device,
-                condition_type=self.args.condition_type
+                condition_type="label_proto"
             )
             z_aug = z_enh[len(z_ref):]
             y_aug = y_enh[len(y_sup):]
@@ -1039,9 +1005,319 @@ class UnifiedTrainer:
             plt.show()
         plt.close()
 
+    def _compute_label_prototypes(self, embeddings, labels, normalize=True, device=None):
+        """计算标签原型：先对每个样本 L2 归一化，再求类均值，再归一化一次"""
+        if device is None:
+            device = embeddings.device
             
+        # 2) 余弦一致的原型：先对每个样本 L2 归一化，再求类均值，再归一化一次
+        E = F.normalize(embeddings, dim=1) if normalize else embeddings
 
+        uniq = torch.unique(labels).to(device)
+        uniq, _ = torch.sort(uniq)            # 保证有序，便于配色/可视化对齐
+        protos = []
+        proto_ids = []
+        for c in uniq.tolist():
+            m = (labels == c)
+            if m.any():
+                p = E[m].mean(0, keepdim=True)
+                if normalize:
+                    p = F.normalize(p, dim=1)
+                protos.append(p)
+                proto_ids.append(c)
 
+        if len(protos) == 0:
+            D = embeddings.size(1)
+            return torch.empty(0, D, device=device), []
 
-    
+        return torch.cat(protos, dim=0), proto_ids
 
+    def visualize_train_data(self, save_path=None):
+        """可视化训练集嵌入的t-SNE图"""
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+        import torch.nn.functional as F
+        import os
+        
+        
+        Z = F.normalize(self.training_embeddings, dim=1).cpu()
+        Y = self.training_labels.cpu().numpy()
+        
+        # 计算标签原型
+        label_protos, proto_ids = self._compute_label_prototypes(
+            self.training_embeddings, self.training_labels, normalize=True, device=self.args.device
+        )
+        label_protos = label_protos.cpu()
+        uniq = proto_ids
+        
+        # 使用已计算的K-means原型
+        kmeans_protos = self.kmeans_prototypes.cpu()
+        
+        # t-SNE
+        X_all = torch.cat([Z, label_protos, kmeans_protos], 0)
+        X2 = TSNE(n_components=2, random_state=42).fit_transform(X_all.numpy())
+        
+        # 分离数据
+        n_samples = len(Z)
+        n_label_protos = len(label_protos)
+        emb2 = X2[:n_samples]
+        label_proto2 = X2[n_samples:n_samples+n_label_protos]
+        kmeans_proto2 = X2[n_samples+n_label_protos:]
+        
+        # 获取坐标范围，用于保持一致的坐标轴
+        x_min, x_max = X2[:, 0].min(), X2[:, 0].max()
+        y_min, y_max = X2[:, 1].min(), X2[:, 1].max()
+        x_margin = (x_max - x_min) * 0.05
+        y_margin = (y_max - y_min) * 0.05
+        
+        # 为每个标签原型生成单独的图
+        for i, c in enumerate(proto_ids):
+            plt.figure(figsize=(10, 8))
+            colors = plt.cm.tab20(np.linspace(0, 1, len(uniq)))
+            
+            # 绘制所有训练样本（灰色，透明度较低）
+            plt.scatter(emb2[:, 0], emb2[:, 1], c='lightgray', s=30, alpha=0.3, label='All samples')
+            
+            # 高亮当前类别的样本
+            mask = (Y == c)
+            if mask.any():
+                plt.scatter(emb2[mask, 0], emb2[mask, 1], c=[colors[i]], s=80, alpha=0.8, 
+                           label=f'Class {c} samples', edgecolors='black', linewidth=0.5)
+            
+            # 绘制当前类别的标签原型
+            if i < len(label_proto2):
+                plt.scatter(label_proto2[i, 0], label_proto2[i, 1], c=[colors[i]], s=300, marker='*', 
+                           edgecolors='black', linewidth=3, label=f'Label Proto {c}')
+            
+            # 绘制所有K-means原型（红色）
+            for j in range(len(kmeans_proto2)):
+                plt.scatter(kmeans_proto2[j, 0], kmeans_proto2[j, 1], c='red', s=200, marker='^', 
+                           edgecolors='black', linewidth=2, label=f'K-means Proto {j}' if j == 0 else "")
+            
+            # 设置一致的坐标轴范围
+            plt.xlim(x_min - x_margin, x_max + x_margin)
+            plt.ylim(y_min - y_margin, y_max + y_margin)
+            
+            plt.title(f'Class {c} Prototype Visualization')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            if save_path:
+                # 为每个原型生成单独的文件
+                base_name = os.path.splitext(save_path)[0]
+                proto_save_path = f"{base_name}_class_{c}.png"
+                plt.savefig(proto_save_path, dpi=300, bbox_inches='tight')
+                print(f"保存类别 {c} 的原型图到: {proto_save_path}")
+            else:
+                plt.show()
+            plt.close()
+        
+        # 生成包含所有原型的总图
+        plt.figure(figsize=(12, 8))
+        colors = plt.cm.tab20(np.linspace(0, 1, len(uniq)))
+        
+        # 绘制训练样本
+        for i, c in enumerate(uniq):
+            mask = (Y == c)
+            if mask.any():
+                plt.scatter(emb2[mask, 0], emb2[mask, 1], c=[colors[i]], s=50, alpha=0.7, label=f'Class {c}')
+        
+        # 绘制标签原型
+        for i, c in enumerate(proto_ids):
+            if i < len(label_proto2):
+                color_idx = uniq.index(c) if c in uniq else i
+                plt.scatter(label_proto2[i, 0], label_proto2[i, 1], c=[colors[color_idx]], s=200, marker='*', 
+                           edgecolors='black', linewidth=2, label=f'Label Proto {c}' if i == 0 else "")
+        
+        # 绘制K-means原型
+        for i in range(len(kmeans_proto2)):
+            plt.scatter(kmeans_proto2[i, 0], kmeans_proto2[i, 1], c='red', s=200, marker='^', 
+                       edgecolors='black', linewidth=2, label=f'K-means Proto {i}' if i == 0 else "")
+        
+        # 设置一致的坐标轴范围
+        plt.xlim(x_min - x_margin, x_max + x_margin)
+        plt.ylim(y_min - y_margin, y_max + y_margin)
+        
+        plt.title('All Prototypes Visualization (Samples + Label Prototypes + K-means Prototypes)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"保存总图到: {save_path}")
+        else:
+            plt.show()
+        plt.close()
+
+    # =========================
+    # 内在质量评估（MMD/FD/多样性/NN）
+    # =========================
+    @staticmethod
+    def _mmd_rbf(X: torch.Tensor, Y: torch.Tensor, sigmas=(0.5, 1.0, 2.0, 4.0)) -> torch.Tensor:
+        def pdist2(a, b):
+            a2 = (a * a).sum(1, keepdim=True)
+            b2 = (b * b).sum(1, keepdim=True).t()
+            return a2 - 2 * (a @ b.t()) + b2
+        dxx = pdist2(X, X); dyy = pdist2(Y, Y); dxy = pdist2(X, Y)
+        Kxx = X.new_zeros(())
+        Kyy = X.new_zeros(())
+        Kxy = X.new_zeros(())
+        for s in sigmas:
+            g = torch.exp(-dxx / (2 * s * s)); Kxx = Kxx + (g.sum() - g.diag().sum()) / (X.size(0) * (X.size(0) - 1))
+            g = torch.exp(-dyy / (2 * s * s)); Kyy = Kyy + (g.sum() - g.diag().sum()) / (Y.size(0) * (Y.size(0) - 1))
+            g = torch.exp(-dxy / (2 * s * s)); Kxy = Kxy + g.mean()
+        return Kxx + Kyy - 2 * Kxy
+
+    @staticmethod
+    def _frechet_distance(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        # 均值
+        mu1, mu2 = X.mean(0), Y.mean(0)
+        diff = mu1 - mu2
+
+        # 协方差（无偏/有偏都可，保持一致即可）
+        Xc = X - mu1
+        Yc = Y - mu2
+        C1 = (Xc.t() @ Xc) / max(1, (X.size(0) - 1))
+        C2 = (Yc.t() @ Yc) / max(1, (Y.size(0) - 1))
+
+        # sqrt(C1)
+        e1, V1 = torch.linalg.eigh(C1)           # C1 对称
+        e1 = e1.clamp_min(0)
+        C1_sqrt = (V1 * e1.sqrt().unsqueeze(0)) @ V1.t()
+
+        # S = sqrt(C1) @ C2 @ sqrt(C1) 也是对称
+        S = C1_sqrt @ C2 @ C1_sqrt
+        es, _ = torch.linalg.eigh(S)             # S 对称
+        es = es.clamp_min(0)
+
+        # tr(sqrt(S)) = sum(sqrt(eigvals(S)))
+        tr_sqrt = es.sqrt().sum()
+
+        fid = (diff @ diff) + torch.trace(C1) + torch.trace(C2) - 2.0 * tr_sqrt
+        # 数值稳定：避免 -1e-6 之类的微小负数
+        return fid.clamp_min(0.0)
+
+    @staticmethod
+    def _pairwise_stats(X: torch.Tensor) -> dict:
+        # 返回均值/方差/分位数，作为多样性指标
+        with torch.no_grad():
+            d = torch.cdist(X, X, p=2)
+            triu = torch.triu_indices(d.size(0), d.size(1), offset=1)
+            vals = d[triu[0], triu[1]]
+            return {
+                'dist_mean': float(vals.mean().item()),
+                'dist_std': float(vals.std(unbiased=False).item()),
+                'dist_p10': float(vals.kthvalue(max(1, int(0.10 * len(vals))))[0].item()),
+                'dist_p50': float(vals.median().item()),
+                'dist_p90': float(vals.kthvalue(max(1, int(0.90 * len(vals))))[0].item()),
+            }
+
+    @staticmethod
+    def _nn_distances(X: torch.Tensor, Y: torch.Tensor) -> dict:
+        # 每个生成样本到最近真实样本的距离统计
+        with torch.no_grad():
+            d = torch.cdist(X, Y, p=2)
+            mins = d.min(dim=1).values
+            return {
+                'nn_mean': float(mins.mean().item()),
+                'nn_std': float(mins.std(unbiased=False).item()),
+                'nn_p10': float(mins.kthvalue(max(1, int(0.10 * len(mins))))[0].item()),
+                'nn_p50': float(mins.median().item()),
+                'nn_p90': float(mins.kthvalue(max(1, int(0.90 * len(mins))))[0].item()),
+            }
+
+    @torch.no_grad()
+    def evaluate_ldm_intrinsic(self, num_samples: int = 1000, log_to_wandb: bool = True) -> dict:
+        assert self.ldm is not None, "LDM not initialized"
+        device = self.args.device
+
+        # —— 选同一批索引 —— #
+        all_emb = self.training_embeddings.detach().to(device)
+        N = all_emb.size(0)
+        if N > num_samples:
+            sel_idx = torch.randperm(N, device=device)[:num_samples]
+        else:
+            sel_idx = torch.arange(N, device=device)
+
+        real = all_emb[sel_idx]
+
+        # —— z 空间对齐 —— #
+        if self.use_znorm:
+            real_z = self.znorm.fwd(real)
+        else:
+            real_z = real
+            if bool(getattr(self.args, 'ldm_unit_sphere', False)):
+                real_z = F.normalize(real_z, dim=1)
+
+        D = real_z.size(1)
+
+        # —— 条件：与 sel_idx 对齐的 labels —— #
+        labels = getattr(self, "training_labels", None)
+        if labels is not None:
+            labels = labels[sel_idx]
+
+        # 直接使用 label_proto 作为生成条件
+        if labels is not None:
+            cond_z = torch.zeros_like(real_z)
+            for cls in torch.unique(labels):
+                m = (labels == cls)
+                if m.any():
+                    cond_z[m] = real_z[m].mean(0, keepdim=True)
+        else:
+            cond_z = real_z
+
+        # —— 生成（z 空间）→ 还原到原空间再评估 —— #
+        # 评估用采样和增强一致：无引导 + 非简单方差 + 降温 + 半径对齐
+        temp = float(getattr(self.args, 'ldm_eval_temp', 0.85))
+        simp = bool(getattr(self.args, 'ldm_eval_simple_var', False))
+        guid = float(getattr(self.args, 'ldm_guidance_eval', 0.0))
+
+        # 用真实样本的半径对齐初始噪声，防止非 unit_sphere 时一开局半径失配
+        init_r = real_z.norm(dim=1)  # [N]
+
+        # 使用模型进行采样
+        ldm_for_eval = self.ldm
+        gen_z = ldm_for_eval.sample(
+            shape=(len(cond_z), D),
+            cond=cond_z,
+            guidance=guid,
+            simple_var=simp,
+            temp=temp,
+            init_match_radius=init_r
+        )
+        gen = self.znorm.inv(gen_z) if self.use_znorm else gen_z
+
+        if bool(getattr(self.args, 'ldm_unit_sphere', False)):
+            norms = gen_z.norm(dim=1)
+            norm_violation = float((norms - 1.0).abs().mean().item())
+        else:
+            norm_violation = 0.0
+
+        mmd = float(self._mmd_rbf(real, gen).item())
+        fd  = float(self._frechet_distance(real, gen).item())
+        
+        # 仅调试：看看 z 空间是否也方差炸了
+        z_div_real = self._pairwise_stats(real_z)
+        z_div_gen  = self._pairwise_stats(gen_z)
+        print(f"[z-space] pairwise real/gen: {z_div_real['dist_mean']:.3f} / {z_div_gen['dist_mean']:.3f}")
+        
+        metrics = {
+            'mmd_rbf': mmd,
+            'frechet_distance': fd,
+            'real_pairwise': self._pairwise_stats(real),
+            'gen_pairwise': self._pairwise_stats(gen),
+            'gen_to_real_nn': self._nn_distances(gen, real),
+            'unit_sphere_norm_violation_mean_abs': norm_violation,
+        }
+        if log_to_wandb and wandb.run is not None:
+            wandb.log({
+                'ldm_intrinsic/mmd_rbf': mmd,
+                'ldm_intrinsic/frechet_distance': fd,
+                'ldm_intrinsic/nn_mean': metrics['gen_to_real_nn']['nn_mean'],
+                'ldm_intrinsic/gen_dist_mean': metrics['gen_pairwise']['dist_mean'],
+            })
+        return metrics
+
+    # refine 相关逻辑已移除

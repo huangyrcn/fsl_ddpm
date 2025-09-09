@@ -53,17 +53,12 @@ class Dataset:
             graph.label = train_classes_mapping[int(graph.label)]
         for i, graph in enumerate(self.test_graphs):
             graph.label = test_classes_mapping[int(graph.label)]
+        
 
-        #
-        # num_validation_graphs = math.floor(0.2 * len(self.train_graphs))
-        # num_validation_graphs = math.floor(0 * len(self.train_graphs))
-
-        # np.random.seed(seed_value)
+        np.random.seed(args.seed)
         np.random.shuffle(self.train_graphs)
 
-        # self.train_graphs = self.train_graphs[: len(self.train_graphs) - num_validation_graphs]
-        # self.validation_graphs = self.train_graphs[len(self.train_graphs) - num_validation_graphs:]
-
+       
         self.train_tasks = defaultdict(list)
         for graph in self.train_graphs:
             self.train_tasks[graph.label].append(graph)
@@ -106,7 +101,9 @@ class Dataset:
         #             self.valid_tasks[graph.label].append(graph)
 
         # np.random.seed(2)
-        # np.random.seed(seed_value)
+        
+
+        np.random.seed(args.seed)
         np.random.shuffle(self.test_graphs)
 
         # self.test_graphs = self.test_graphs[:self.args.K_shot + self.args.N_way * (self.args.query_size) * 200] # no useful
@@ -133,7 +130,6 @@ class Dataset:
                 lam = np.random.beta(0.5, 0.5)
                 lam = max(lam, 1 - lam)
 
-                # emb1 = self.train_graphs[fir[i]].node_features / self.train_graphs[fir[i]].norm(dim=1)
                 match = self.test_fine_tune_list[index][fir[i]].node_features @ self.test_fine_tune_list[index][
                     sec[i]].node_features.T
                 normalized_match = F.softmax(match, dim=0)
@@ -144,7 +140,7 @@ class Dataset:
                 mixed_adj[mixed_adj < 0.1] = 0
                 mixed_x = lam * self.test_fine_tune_list[index][fir[i]].node_features + (
                             1 - lam) * normalized_match.float() @ self.test_fine_tune_list[index][sec[i]].node_features
-                # mixed_y = [self.test_fine_tune_list[fir[i]].label, self.test_fine_tune_list[sec[i]].label]
+            
 
                 edge_index, _ = dense_to_sparse(mixed_adj)
                 edges = [(x, y) for x, y in zip(edge_index[0].tolist(), edge_index[1].tolist())]
@@ -160,13 +156,9 @@ class Dataset:
                 self.generate_test_graphs[index].append(G)
 
         print("generate yes")
-        #         print("generate len is ", len(generate_test_graphs))
-        #         print("before the number of train graphs is ", len(self.test_graphs))
-        #         self.train_graphs.extend(generate_train_graphs)
-        #         print("after the number of train graphs is ", len(self.train_graphs))
-        rd = RandomState(0)
-        rd.shuffle(self.total_test_g_list)
-        # rd.shuffle(self.test_fine_tune)
+        np.random.seed(args.seed)
+        np.random.shuffle(self.total_test_g_list)
+
 
     def sample_one_task(self, task_source, class_index, K_shot, query_size, test_start_idx=None):
 

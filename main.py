@@ -51,30 +51,30 @@ def build_cfg():
         'use_pretrained_encoder': False,
         'use_pretrained_ldm': True,
         'num_augmented_samples': 0,
-        'refine_support_before_training': False,
         'learning_rate_ldm': 1e-4,
         'weight_decay_ldm': 1e-4,
         'time_steps': 50,
         'beta_start': 1e-4,
         'beta_end': 2e-2,
         'ldm_batch_size': 512,
-        'ldm_ema_decay': 0.9,
         'ldm_es_interval': 100,
         'condition_type': 'class_proto',
         'batch_size_for_embedding': 512,
         # wandb 默认
         'use_wandb': False,
         'wandb_online': True,
+        # 内在质量评估开关
+        'evaluate_ldm_intrinsic': False,
+        'evaluate_ldm_intrinsic_num_samples': 1000,
     }
     defaults = OmegaConf.create(default_config)
 
     # CLI（最高优先级），支持 config=xxx 覆盖路径
     cli = OmegaConf.from_cli()
-    config_path = cli.get('config', 'configs/TRIANGLES_ldm.yaml')
+    config_path = cli.get('config', 'configs/Letter_high_ldm.yaml')
 
     # 配置文件（中间优先级）
-    base = OmegaConf.load(config_path) if os.path.exists(config_path) else OmegaConf.create({})
-
+    base = OmegaConf.load(config_path)
     # 合并：默认 < 文件 < CLI
     cfg = OmegaConf.merge(defaults, base, cli)
 
@@ -196,6 +196,9 @@ def main():
         unified_trainer.init_ldm_components()
         unified_trainer.collect_training_embeddings()
         
+        # 降维分析 训练数据
+        # unified_trainer.visualize_train_data(save_path=os.path.join(results_dir, f"{dataset}-train-embeddings.png"))
+
         # 阶段3：训练LDM（或从ckpt加载跳过训练）
         if cfg.use_pretrained_ldm:
             print("=== 跳过LDM训练，加载已保存的LDM权重 ===")
@@ -204,12 +207,26 @@ def main():
             unified_trainer.train_ldm()
         
 
+        # 可选：内在质量评估（不依赖下游分类）
+        if bool(getattr(cfg, 'evaluate_ldm_intrinsic', False)):
+            print("=== 内在质量评估（MMD/FD/多样性/最近邻） ===")
+            # 确保有LDM权重
+            if unified_trainer.ldm is None:
+                unified_trainer.init_ldm_components()
+                if os.path.exists(os.path.join(save_dir, f'{cfg.dataset_name}_ldm.pkl')):
+                    unified_trainer.load_pretrained_ldm(os.path.join(save_dir, f'{cfg.dataset_name}_ldm.pkl'))
+            metrics = unified_trainer.evaluate_ldm_intrinsic(
+                num_samples=int(getattr(cfg, 'evaluate_ldm_intrinsic_num_samples', 1000)),
+                log_to_wandb=bool(getattr(cfg, 'use_wandb', False))
+            )
+            print({k: (v if not isinstance(v, dict) else {ik: iv for ik, iv in v.items()}) for k, v in metrics.items()})
+
         # ==================== 测试评估阶段 ====================
         print("=== 开始测试评估 ===")
         
         # 加载LDM模型（如果需要的话）
         ldm_model = None
-        if cfg.num_augmented_samples > 0 or cfg.refine_support_before_training:
+        if cfg.num_augmented_samples > 0:
             print("=== 加载LDM模型 ===")
             ldm_model_path = os.path.join(save_dir, f'{cfg.dataset_name}_ldm.pkl')
             if os.path.exists(ldm_model_path):
@@ -221,7 +238,6 @@ def main():
         print("=== 测试 ===")
         test_acc, test_std = unified_trainer.test_model(
             num_augmented_samples=cfg.num_augmented_samples,
-            refine_support_before_training=cfg.refine_support_before_training,
             ldm_model=ldm_model,
             test_name="测试"
         )

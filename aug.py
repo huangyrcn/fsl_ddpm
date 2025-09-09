@@ -10,7 +10,8 @@ def main():
     pass
 
 
-def aug_drop_node(batch_graph):
+def aug_drop_node(batch_graph, seed):
+    np.random.seed(seed)
     for i, graph in enumerate(batch_graph):
         node_num, _ = graph.node_features.size()
         _, edge_num = graph.edge_mat.size()
@@ -31,7 +32,8 @@ def aug_drop_node(batch_graph):
     return batch_graph
 
 
-def aug_fea_mask(batch_graph):
+def aug_fea_mask(batch_graph, seed):
+    np.random.seed(seed)
     for i, graph in enumerate(batch_graph):
         node_num, feat_dim = graph.node_features.size()
         mask_num = int(node_num / 10)
@@ -43,7 +45,8 @@ def aug_fea_mask(batch_graph):
     return batch_graph
 
 
-def aug_fea_drop(batch_graph):
+def aug_fea_drop(batch_graph, seed):
+    torch.manual_seed(seed)
     for i, graph in enumerate(batch_graph):
         drop_mask = torch.empty((graph.node_features.size(1),), dtype=torch.float32).uniform_(0, 1) < 0.1
         graph.node_features = graph.node_features.clone()
@@ -51,7 +54,8 @@ def aug_fea_drop(batch_graph):
     return batch_graph
 
 
-def aug_fea_dropout(batch_graph):
+def aug_fea_dropout(batch_graph, seed):
+    torch.manual_seed(seed)
     for i, graph in enumerate(batch_graph):
         graph.node_features = F.dropout(graph.node_features, p=0.1)
     return batch_graph
