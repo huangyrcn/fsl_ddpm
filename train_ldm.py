@@ -215,6 +215,7 @@ class VectorUNet(nn.Module):
 
         out = self.out(h)  # [B, x_dim]
         return out  # 作为 v̂ 或 ε̂
+
 class LDM(nn.Module):
     def __init__(
         self,
@@ -317,7 +318,6 @@ class LDM(nn.Module):
         if self.self_condition and (x0_sc is not None):
             use_sc = (torch.rand(B, device=x0.device) < 0.5)
             x0_sc_eff = torch.where(use_sc.unsqueeze(1), x0_sc, torch.zeros_like(x0_sc))
-            
         else:
             x0_sc_eff = None
 

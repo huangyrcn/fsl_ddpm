@@ -31,7 +31,7 @@ sample_input_size: 256
 graph_pooling_type: sum
 
 # ckpt
-use_pretrained_encoder: false
+use_pretrained_encoder: true
 encoder_ckpt_path: ./savepoint/TRIANGLES_encoder.pkl
 
 use_pretrained_ldm: false # 是否跳过LDM训练并从ckpt加载
@@ -43,7 +43,7 @@ weight_decay_ldm: 1.0e-04
 num_epochs_ldm: 200000
 patience_ldm: 200
 time_steps: 50
-ldm_batch_size: 512
+ldm_batch_size: 1024
 
 # 新版LDM参数
 ldm_predict: v                    # 'v' 或 'eps'，推荐 'v'
@@ -53,17 +53,17 @@ ldm_n_blocks: 2                  # 每阶段块数
 ldm_use_zero_mlp: true           # 是否使用Zero-MLP分支
 ldm_p_uncond: 0.1                # CFG训练时条件丢弃概率
 ldm_lambda_proto: 0.0            # 原型一致性正则权重
-ldm_guidance: 3.0                # CFG采样时的引导强度
+# ldm_guidance: 3.0                # CFG采样时的引导强度
 ldm_es_interval: 100             # LDM早停检查间隔（与打印间隔一致）
 # 条件类型配置：固定使用 kmeans_proto (训练) 和 label_proto (生成)
 
 
 
 #可视化处理的batch
-batch_size_for_embedding: 512
+batch_size_for_embedding: 2048
 
 # 任务评估相关
-num_augmented_samples: 10
+num_augmented_samples: 0
 
 # 任务级微调参数
 task_finetune_steps: 0           # 任务级微调步数，0表示不微调
@@ -83,3 +83,18 @@ wandb_run_name: "TRIANGLES_experiment"
 wandb_entity: "huangyrcn"  # 替换为你的团队名称
 wandb_online: true
 
+# 生成温度与引导
+ldm_aug_temp: 0.9
+ldm_aug_simple_var: false
+ldm_guidance: 1.8
+
+# 条件多样性
+aug_mix_alpha: 0.5          # 条件 = α*类均值 + (1-α)*同类随机样本
+aug_cond_noise_std: 0.15    # 条件上加轻噪声（z 空间）
+
+# 过滤阈值（余弦）
+aug_cosine_min_to_proto: 0.35  # 与类原型太远丢
+aug_cosine_max_to_nn: 0.98     # 与最近真实样本太近（几乎重复）丢
+
+# 每类增强上限：最多扩到 (1 + ratio) 倍
+aug_per_class_max_ratio: 1.0    # 1:1 上限
