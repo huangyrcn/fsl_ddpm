@@ -1,5 +1,42 @@
+# 数据集文件
 datasets/*
+data.zip
+data/*
+# Python缓存
 *.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+
+# 模型保存点
 savepoint/*
+
+# 实验结果
 our_results/*
+
+# Wandb日志
 wandb/*
+
+# VS Code配置
+.vscode/
+
+# Mac系统文件
+.DS_Store
+
+# 临时文件
+*.tmp
+*.bak
+*.orig
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# 环境文件
+.env
+.venv/
+venv/
+
+# 其他日志
+*.log

@@ -436,10 +436,18 @@ class LDM(nn.Module):
 # =========================
 # 辅助函数：微调参数过滤器
 # =========================
-def finetune_param_filter(name: str) -> bool:
+def finetune_param_filter(name_or_tuple):
     """
     微调时只训练小分支的参数过滤器
     返回 True 表示该参数需要训练
+    支持两种调用方式：
+    1. finetune_param_filter(name) - 直接传递参数名
+    2. finetune_param_filter((name, param)) - 传递(名称,参数)元组
     """
+    if isinstance(name_or_tuple, tuple):
+        name, param = name_or_tuple
+    else:
+        name = name_or_tuple
+    
     keys = ["film", "FiLM", "cond_proj", "zero", "lora_A", "lora_B", "gate"]
     return any(k in name for k in keys)

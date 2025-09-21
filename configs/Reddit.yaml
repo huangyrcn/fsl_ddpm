@@ -1,27 +1,146 @@
+# =========================
+# 基础配置（数据集 & 模型）
+# =========================
 dataset_name: Reddit
 baseline_mode: null
+seed: 42
+
+# Few-shot 任务配置
 N_way: 4
 K_shot: 5
 query_size: 10
-patience: 5
-dropout: 0.5
-batch: 128
+
+# 数据集属性
+train_classes_num: 7
+test_classes_num: 4
+node_fea_size: 602
+sample_input_size: 256
+
+# =========================
+# Encoder 网络配置
+# =========================
+# GIN 网络结构
 gin_layer: 3
 gin_hid: 128
+dropout: 0.5
+
+# 图增强策略
 aug1: node_drop
 aug2: feature_mask
 t: 0.2
+
+# 图池化方式
+graph_pooling_type: sum
+
+# 训练超参数
 lr: 0.001
-weight_decay: 1.0e-07
-eval_interval: 100
+weight_decay: 1.0e-7
 epoch_num: 3000
+eval_interval: 100
+patience: 5
+
+# 其他训练选项
 use_select_sim: false
 save_test_emb: true
 
-num_token: 1
-use_prompt: true
-device: cuda
-train_classes_num: 7
-test_classes_num: 4
-node_fea_size: 524
-sample_input_size: 256
+# =========================
+# Encoder 预训练模型
+# =========================
+use_pretrained_encoder: false
+encoder_ckpt_path: ./savepoint/Reddit_encoder.pkl
+encoder_batch_size: 512
+
+# =========================
+# LDM 核心配置
+# =========================
+# 模型加载
+use_pretrained_ldm: true
+ldm_ckpt_path: ./savepoint/Reddit_ldm.pkl
+
+# 网络架构
+ldm_predict: v               # 'v'（推荐）或 'eps'
+ldm_unit_sphere: false
+ldm_widths: [256, 512, 512]  # 适应中等维度特征
+ldm_n_blocks: 2
+ldm_use_zero_mlp: true
+
+# 扩散过程参数
+time_steps: 300
+beta_start: 0.0001
+beta_end: 0.05
+
+# =========================
+# LDM 训练超参数
+# =========================
+learning_rate_ldm: 1.0e-4
+weight_decay_ldm: 1.0e-4
+num_epochs_ldm: 30000
+patience_ldm: 1000
+ldm_batch_size: 512
+ldm_es_interval: 200
+
+# 训练期 CFG & 正则化
+ldm_p_uncond: 0.3
+ldm_lambda_proto: 0.1
+
+# =========================
+# LDM 评估与生成配置
+# =========================
+# 内在性能评估
+evaluate_ldm_intrinsic: true
+evaluate_ldm_intrinsic_num_samples: 1000
+
+# CFG 引导强度
+ldm_guidance: 2.5              # 增强采样时使用
+ldm_guidance_eval: 0.0         # 评估时关闭CFG
+
+# 采样温度与方差
+ldm_aug_temp: 0.9
+ldm_aug_simple_var: true
+ldm_eval_temp: 1.0
+ldm_eval_simple_var: false
+
+# =========================
+# Few-shot 增强策略
+# =========================
+# 增强样本生成
+num_augmented_samples: 30
+
+# 质量过滤阈值
+ldm_filter_cos_lo: 0.16        # 适中要求
+ldm_filter_cos_hi: 0.92        
+ldm_aug_max_ratio: 3.50        # 4-way任务，较大扩增空间
+
+# 条件多样化
+ldm_cond_mix_alpha: 0.30       # 条件混合比例
+ldm_cond_noise: 0.05           # 标准噪声强度
+
+# =========================
+# 任务级微调配置
+# =========================
+task_finetune_steps: 5000
+task_finetune_lr: 2.0e-4
+task_finetune_weight_decay: 1.0e-5
+task_finetune_cond_dropout: 0.10
+task_finetune_grad_clip: 1.0
+task_finetune_patience: 200
+task_finetune_warmup_steps: 200
+task_lambda_proto: 0.05
+task_finetune_accum_steps: 4
+task_finetune_micro_repeats: 4
+task_finetune_ema_alpha: 0.98
+
+# =========================
+# 系统配置
+# =========================
+# 系统配置
+device: cuda:0
+
+# =========================
+# 实验记录 (WandB)
+# =========================
+use_wandb: false
+wandb_project: "my_fsl_project"
+wandb_run_name: "Reddit_ldm_experiment"
+wandb_entity: "huangyrcn"
+wandb_online: true

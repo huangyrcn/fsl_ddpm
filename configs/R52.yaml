@@ -1,19 +1,19 @@
 # =========================
 # 基础配置（数据集 & 模型）
 # =========================
-dataset_name: ENZYMES
+dataset_name: R52
 baseline_mode: null
 seed: 42
 
 # Few-shot 任务配置
-N_way: 2
+N_way: 5
 K_shot: 5
 query_size: 10
 
 # 数据集属性
-train_classes_num: 4
-test_classes_num: 2
-node_fea_size: 21
+train_classes_num: 47
+test_classes_num: 5
+node_fea_size: 2000
 sample_input_size: 256
 
 # =========================
@@ -33,7 +33,7 @@ t: 0.2
 graph_pooling_type: sum
 
 # 训练超参数
-lr: 1.0e-4
+lr: 0.001
 weight_decay: 1.0e-7
 epoch_num: 3000
 eval_interval: 100
@@ -46,16 +46,16 @@ save_test_emb: true
 # =========================
 # Encoder 预训练模型
 # =========================
-use_pretrained_encoder: false
-encoder_ckpt_path: ./savepoint/ENZYMES_encoder.pkl
+use_pretrained_encoder: true
+encoder_ckpt_path: ./savepoint/R52_encoder.pkl
 encoder_batch_size: 512
 
 # =========================
 # LDM 核心配置
 # =========================
 # 模型加载
-use_pretrained_ldm: false
-ldm_ckpt_path: ./savepoint/ENZYMES_ldm.pkl
+use_pretrained_ldm: true
+ldm_ckpt_path: ./savepoint/R52_ldm.pkl
 
 # 网络架构
 ldm_predict: v               # 'v'（推荐）或 'eps'
@@ -104,16 +104,16 @@ ldm_eval_simple_var: false
 # Few-shot 增强策略
 # =========================
 # 增强样本生成
-num_augmented_samples: 30
+num_augmented_samples: 25     
 
 # 质量过滤阈值
-ldm_filter_cos_lo: 0.15        # 与类原型最小相似度
-ldm_filter_cos_hi: 0.92        # 与真实样本最大相似度
-ldm_aug_max_ratio: 3.50        # 每类最大扩增比例
+ldm_filter_cos_lo: 0.18        # 适中要求，文本特征相对稀疏
+ldm_filter_cos_hi: 0.91        
+ldm_aug_max_ratio: 3.00        # 5-way任务，适度扩增
 
 # 条件多样化
 ldm_cond_mix_alpha: 0.30       # 条件混合比例
-ldm_cond_noise: 0.05           # 条件微噪声强度
+ldm_cond_noise: 0.04           # 适中噪声强度
 
 # =========================
 # 任务级微调配置
@@ -140,6 +140,6 @@ device: cuda
 # =========================
 use_wandb: false
 wandb_project: "my_fsl_project"
-wandb_run_name: "ENZYMES_ldm_experiment"
+wandb_run_name: "R52_ldm_experiment"
 wandb_entity: "huangyrcn"
 wandb_online: true

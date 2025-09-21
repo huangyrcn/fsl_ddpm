@@ -21,6 +21,7 @@ def build_cfg():
     """
     # 代码默认值（最低优先级）
     default_config = {
+        'seed': 42,
         'dataset_name': 'TRIANGLES',
         'baseline_mode': None,
         'N_way': 3,
@@ -28,7 +29,7 @@ def build_cfg():
         'query_size': 10,
         'patience': 5,
         'dropout': 0.5,
-        'batch': 128,  # 未使用，占位
+        'sample_input_size': 256,
         'gin_layer': 3,
         'gin_hid': 128,
         'aug1': 'node_drop',
@@ -196,12 +197,12 @@ def main():
         # 降维分析 训练数据
         # unified_trainer.visualize_train_data(save_path=os.path.join(results_dir, f"{dataset}-train-embeddings.png"))
 
-        # 阶段3：训练LDM（或从ckpt加载跳过训练）
-        if cfg.use_pretrained_ldm:
-            print("=== 跳过LDM训练，加载已保存的LDM权重 ===")
-            unified_trainer.load_pretrained_ldm(cfg.ldm_ckpt_path if 'ldm_ckpt_path' in cfg else None)
-        else:
-            unified_trainer.train_ldm()
+        # # 阶段3：训练LDM（或从ckpt加载跳过训练）
+        # if cfg.use_pretrained_ldm:
+        #     print("=== 跳过LDM训练，加载已保存的LDM权重 ===")
+        #     unified_trainer.load_pretrained_ldm(cfg.ldm_ckpt_path if 'ldm_ckpt_path' in cfg else None)
+        # else:
+        #     unified_trainer.train_ldm()
         
 
         # 可选：内在质量评估（不依赖下游分类）

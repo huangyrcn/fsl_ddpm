@@ -1,19 +1,19 @@
 # =========================
 # 基础配置（数据集 & 模型）
 # =========================
-dataset_name: ENZYMES
+dataset_name: Letter_high
 baseline_mode: null
 seed: 42
 
 # Few-shot 任务配置
-N_way: 2
-K_shot: 5
+N_way: 4
+K_shot: 10
 query_size: 10
 
 # 数据集属性
-train_classes_num: 4
-test_classes_num: 2
-node_fea_size: 21
+train_classes_num: 13
+test_classes_num: 4
+node_fea_size: 5
 sample_input_size: 256
 
 # =========================
@@ -33,7 +33,7 @@ t: 0.2
 graph_pooling_type: sum
 
 # 训练超参数
-lr: 1.0e-4
+lr: 0.001
 weight_decay: 1.0e-7
 epoch_num: 3000
 eval_interval: 100
@@ -46,16 +46,16 @@ save_test_emb: true
 # =========================
 # Encoder 预训练模型
 # =========================
-use_pretrained_encoder: false
-encoder_ckpt_path: ./savepoint/ENZYMES_encoder.pkl
+use_pretrained_encoder: true
+encoder_ckpt_path: ./savepoint/Letter_high_encoder.pkl
 encoder_batch_size: 512
 
 # =========================
 # LDM 核心配置
 # =========================
 # 模型加载
-use_pretrained_ldm: false
-ldm_ckpt_path: ./savepoint/ENZYMES_ldm.pkl
+use_pretrained_ldm: true
+ldm_ckpt_path: ./savepoint/Letter_high_ldm.pkl
 
 # 网络架构
 ldm_predict: v               # 'v'（推荐）或 'eps'
@@ -140,6 +140,6 @@ device: cuda
 # =========================
 use_wandb: false
 wandb_project: "my_fsl_project"
-wandb_run_name: "ENZYMES_ldm_experiment"
+wandb_run_name: "experiment_001"
 wandb_entity: "huangyrcn"
 wandb_online: true

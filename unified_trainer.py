@@ -29,16 +29,17 @@ class ZScore:
         self.std = (X.var(0, unbiased=False, keepdim=True) + eps).sqrt()
     
     def fwd(self, X): 
-        return (X - self.mu) / self.std
+        # +1e-12 提升数值稳定性（与 inv 对齐）
+        return (X - self.mu) / (self.std + 1e-12)
     
     def inv(self, Z): 
-        return Z * self.std + self.mu
+        return Z * (self.std + 1e-12) + self.mu
 
 
 from gnn_model import Model, Prompt, LogReg
-from train_ldm import LDM, finetune_param_filter
+from ldm import LDM, finetune_param_filter
 from dataset import Dataset
-from aug import aug_fea_mask, aug_drop_node, aug_fea_drop, aug_fea_dropout
+from aug import feature_mask, node_drop, feature_drop, feature_dropout
 
 
 class UnifiedTrainer:
@@ -111,23 +112,31 @@ class UnifiedTrainer:
         
         if self.args.aug1 == 'identity':
             graph_aug1 = self.dataset.train_graphs
-        elif self.args.aug1 == 'node_drop':
-            graph_aug1 = aug_drop_node(self.dataset.train_graphs, self.args.seed)
-        elif self.args.aug1 == 'feature_mask':
-            graph_aug1 = aug_fea_mask(self.dataset.train_graphs, self.args.seed)
-        elif self.args.aug1 == 'feature_drop':
-            graph_aug1 = aug_fea_drop(self.dataset.train_graphs, self.args.seed)
+        elif self.args.aug1 in ['node_drop', 'drop_node']:
+            graph_aug1 = node_drop(self.dataset.train_graphs, self.args.seed)
+        elif self.args.aug1 in ['feature_mask', 'mask_feature']:
+            graph_aug1 = feature_mask(self.dataset.train_graphs, self.args.seed)
+        elif self.args.aug1 in ['feature_drop', 'drop_feature']:
+            graph_aug1 = feature_drop(self.dataset.train_graphs, self.args.seed)
         elif self.args.aug1 == 'feature_dropout':
-            graph_aug1 = aug_fea_dropout(self.dataset.train_graphs, self.args.seed)
+            graph_aug1 = feature_dropout(self.dataset.train_graphs, self.args.seed)
+        else:
+            # 如果没有匹配，默认使用identity
+            print(f"⚠️ 未识别的aug1类型: {self.args.aug1}，使用identity")
+            graph_aug1 = self.dataset.train_graphs
 
-        if self.args.aug2 == 'node_drop':
-            graph_aug2 = aug_drop_node(graph_copy_2, self.args.seed)
-        elif self.args.aug2 == 'feature_mask':
-            graph_aug2 = aug_fea_mask(graph_copy_2, self.args.seed)
-        elif self.args.aug2 == 'feature_drop':
-            graph_aug2 = aug_fea_drop(self.dataset.train_graphs, self.args.seed)
+        if self.args.aug2 in ['node_drop', 'drop_node']:
+            graph_aug2 = node_drop(graph_copy_2, self.args.seed)
+        elif self.args.aug2 in ['feature_mask', 'mask_feature']:
+            graph_aug2 = feature_mask(graph_copy_2, self.args.seed)
+        elif self.args.aug2 in ['feature_drop', 'drop_feature']:
+            graph_aug2 = feature_drop(self.dataset.train_graphs, self.args.seed)
         elif self.args.aug2 == 'feature_dropout':
-            graph_aug2 = aug_fea_dropout(self.dataset.train_graphs, self.args.seed)
+            graph_aug2 = feature_dropout(self.dataset.train_graphs, self.args.seed)
+        else:
+            # 如果没有匹配，默认使用identity
+            print(f"⚠️ 未识别的aug2类型: {self.args.aug2}，使用identity")
+            graph_aug2 = graph_copy_2
 
         print("图增强完成!")
         
@@ -281,8 +290,9 @@ class UnifiedTrainer:
         patience = self.args.patience_ldm
         check_interval = int(self.args.ldm_es_interval)
         
-        # 创建进度条
-        pbar = tqdm(range(1, self.args.num_epochs_ldm + 1), desc="LDM Training")
+        # 创建进度条 - 动态长度显示
+        pbar = tqdm(range(1, self.args.num_epochs_ldm + 1), desc="LDM Training", 
+                   ncols=120, dynamic_ncols=True, leave=True)
         
         for epoch in pbar:
             # 随机打乱数据
