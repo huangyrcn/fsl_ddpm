@@ -19,6 +19,9 @@ sample_input_size: 256
 # =========================
 # Encoder 网络配置
 # =========================
+# 编码器类型选择
+encodertype: gin  # 可选: 'gin' 或 'lgin'
+
 # GIN 网络结构
 gin_layer: 3
 gin_hid: 128

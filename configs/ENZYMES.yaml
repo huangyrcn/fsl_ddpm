@@ -19,15 +19,18 @@ sample_input_size: 256
 # =========================
 # Encoder 网络配置
 # =========================
+# 编码器类型选择
+encodertype: gin  # 可选: 'gin' 或 'lgin'
+
 # GIN 网络结构
 gin_layer: 3
-gin_hid: 128
-dropout: 0.5
+gin_hid: 512
+dropout: 0.1
 
 # 图增强策略
 aug1: node_drop
 aug2: feature_mask
-t: 0.2
+t: 0.5
 
 # 图池化方式
 graph_pooling_type: sum
@@ -37,7 +40,7 @@ lr: 1.0e-4
 weight_decay: 1.0e-7
 epoch_num: 3000
 eval_interval: 100
-patience: 5
+patience: 10
 
 # 其他训练选项
 use_select_sim: false
@@ -48,7 +51,7 @@ save_test_emb: true
 # =========================
 use_pretrained_encoder: false
 encoder_ckpt_path: ./savepoint/ENZYMES_encoder.pkl
-encoder_batch_size: 512
+encoder_batch_size: 128
 
 # =========================
 # LDM 核心配置

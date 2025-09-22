@@ -134,7 +134,7 @@ task_finetune_ema_alpha: 0.98
 # 系统配置
 # =========================
 # 系统配置
-device: cuda:0
+device: cuda
 
 # =========================
 # 实验记录 (WandB)

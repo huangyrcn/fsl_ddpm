@@ -19,6 +19,9 @@ sample_input_size: 256
 # =========================
 # Encoder 网络配置
 # =========================
+# 编码器类型选择
+encodertype: gin  # 可选: 'gin' 或 'lgin'
+
 # GIN 网络结构
 gin_layer: 3
 gin_hid: 128
@@ -46,7 +49,7 @@ save_test_emb: true
 # =========================
 # Encoder 预训练模型
 # =========================
-use_pretrained_encoder: true
+use_pretrained_encoder: false
 encoder_ckpt_path: ./savepoint/Letter_high_encoder.pkl
 encoder_batch_size: 512
 
@@ -54,7 +57,7 @@ encoder_batch_size: 512
 # LDM 核心配置
 # =========================
 # 模型加载
-use_pretrained_ldm: true
+use_pretrained_ldm: false
 ldm_ckpt_path: ./savepoint/Letter_high_ldm.pkl
 
 # 网络架构
